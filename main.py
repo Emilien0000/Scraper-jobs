@@ -109,31 +109,49 @@ def extract_indeed_jobtype(url: str) -> tuple[str | None, str | None]:
 def filter_by_category(jobs: list[dict], category: str | None) -> list[dict]:
     """
     Post-filtre les offres selon la catégorie voulue.
-    Indispensable car JobSpy ne respecte pas toujours les filtres Indeed.
+    Stratégie permissive : signal direct OU indirect car Indeed tronque
+    les descriptions à ~400 chars et "alternance" peut ne pas y apparaître.
     """
     if not category:
         return jobs
 
-    ALTERNANCE_RE = re.compile(
-        r"alternance|apprentissage|contrat d.apprentissage|contrat pro|"
-        r"en alternance|par alternance|bachelor.*alternance|master.*alternance|"
-        r"bts.*alternance|alternant",
+    ALTERNANCE_DIRECT = re.compile(
+        r"alternance|alternant|apprentissage|contrat d.apprentissage|"
+        r"contrat pro|contrat d.alternance|en alternance|par alternance",
+        re.IGNORECASE
+    )
+    ALTERNANCE_INDIRECT = re.compile(
+        r"\bbac\s*[+]?\s*[1-6]\b|\bbts\b|\bbut\b|\biut\b|"
+        r"\blicence\s*pro|\bmaster\b|\bmba\b|\bmsc\b|\bbachelor\b|"
+        r"\bcfa\b|\bopco\b|rythme.*entreprise|formation.*entreprise",
         re.IGNORECASE
     )
     STAGE_RE = re.compile(
-        r"stage|stagiaire|internship|intern",
+        r"\bstage\b|stagiaire|internship|\bintern\b",
         re.IGNORECASE
     )
 
     filtered = []
     for job in jobs:
-        text = f"{job.get('title','')} {job.get('description','')} {job.get('type','')}"
-        if category == "alternance" and ALTERNANCE_RE.search(text):
-            job["type"] = "alternance"
-            filtered.append(job)
-        elif category == "stage" and STAGE_RE.search(text):
-            job["type"] = "stage"
-            filtered.append(job)
+        title = job.get("title", "")
+        desc  = job.get("description", "")
+        jtype = str(job.get("type", "")).lower()
+        text  = f"{title} {desc}"
+
+        if category == "alternance":
+            if (
+                ALTERNANCE_DIRECT.search(text)
+                or jtype == "alternance"
+                or ALTERNANCE_INDIRECT.search(text)
+            ):
+                job["type"] = "alternance"
+                filtered.append(job)
+
+        elif category == "stage":
+            if STAGE_RE.search(text) or jtype == "stage":
+                job["type"] = "stage"
+                filtered.append(job)
+
     return filtered
 
 def guess_type(title: str, description: str = "") -> str:
@@ -314,10 +332,10 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
             indeed_jt, filter_cat = extract_indeed_jobtype(url)
             try:
                 # On demande plus de résultats pour compenser le post-filtrage
-                fetch_limit = limit * 4 if filter_cat else limit
+                fetch_limit = limit * 6 if filter_cat else limit  # sur-scrape pour compenser le post-filtrage
                 jobs = await scrape_indeed_jobspy(keywords, location, fetch_limit, indeed_jt)
                 if filter_cat:
-                    jobs = filter_by_category(jobs, filter_cat)
+                    jobs = filter_by_category(jobs, filter_cat)[:limit]
                 strategy_used = f"jobspy_indeed (filter={filter_cat or 'none'})"
                 if not jobs:
                     raise ValueError("JobSpy a retourné 0 résultat après filtrage")
