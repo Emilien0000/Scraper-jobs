@@ -110,9 +110,12 @@ def build_indeed_rss(search_url: str) -> str:
     parsed = urlparse(search_url)
     params = parse_qs(parsed.query)
     q  = params.get("q",  ["alternance"])[0]
-    l  = params.get("l",  ["France"])[0]
+    # Ne pas inclure l= vide — Indeed RSS le rejette silencieusement
+    l  = params.get("l",  [None])[0]
     jt = params.get("jt", [None])[0]
-    rss_params = {"q": q, "l": l, "format": "rss", "fromage": "14", "sort": "date"}
+    rss_params: dict = {"q": q, "format": "rss", "fromage": "14", "sort": "date"}
+    if l:
+        rss_params["l"] = l
     if jt:
         rss_params["jt"] = jt
     base = f"{parsed.scheme}://{parsed.netloc}/rss"
@@ -127,6 +130,13 @@ async def scrape_indeed_rss(search_url: str, limit: int = 20) -> list[dict]:
         })
     r.raise_for_status()
     feed = feedparser.parse(r.text)
+
+    # Feed vide → lever une exception pour déclencher le fallback fetch dans le dispatcher
+    if not feed.entries:
+        raise ValueError(
+            f"Indeed RSS vide (bozo={feed.get('bozo')}, status={getattr(feed, 'status', '?')})"
+        )
+
     jobs = []
     for entry in feed.entries[:limit]:
         title   = entry.get("title", "")
@@ -136,7 +146,6 @@ async def scrape_indeed_rss(search_url: str, limit: int = 20) -> list[dict]:
         company = ""
         if hasattr(entry, "source") and isinstance(entry.source, dict):
             company = entry.source.get("title", "")
-        # Indeed RSS inclut parfois la ville dans indeed_city ou tags
         location = getattr(entry, "indeed_city", "") or ""
         if not location and entry.get("tags"):
             location = entry.tags[0].get("term", "")
@@ -153,7 +162,81 @@ async def scrape_indeed_rss(search_url: str, limit: int = 20) -> list[dict]:
         })
     return jobs
 
-# ── Stratégie 2 : France Travail API publique ─────────────────────────────────
+async def scrape_indeed_html(search_url: str, limit: int = 20) -> list[dict]:
+    """
+    Fallback HTML pour Indeed quand le RSS est vide/bloqué.
+    Indeed injecte les offres dans un blob JSON window.mosaic.providerData["mosaic-provider-jobcards"]
+    — on l'extrait sans navigateur headless.
+    """
+    async with httpx.AsyncClient(
+        timeout=25,
+        follow_redirects=True,
+        headers=browser_headers("https://www.google.fr/"),
+    ) as client:
+        r = await client.get(search_url)
+
+    html = r.text
+    jobs = []
+
+    # Indeed injecte les données de résultats dans un JSON global
+    match = re.search(
+        r'window\.mosaic\.providerData\["mosaic-provider-jobcards"\]\s*=\s*(\{.*?\});\s*window\.mosaic',
+        html, re.DOTALL
+    )
+    if match:
+        try:
+            data   = json.loads(match.group(1))
+            result = data.get("metaData", {}).get("mosaicProviderJobCardsModel", {})
+            cards  = result.get("results", [])
+            for card in cards[:limit]:
+                title   = card.get("displayTitle") or card.get("title", "")
+                company = card.get("company", "")
+                location= card.get("formattedLocation", "")
+                jk      = card.get("jobkey", "")
+                url_job = f"https://fr.indeed.com/viewjob?jk={jk}" if jk else search_url
+                desc    = strip_html(card.get("snippet", ""))[:400]
+                date    = safe_date(card.get("pubDate") or card.get("createDate"))
+                jobs.append({
+                    "id":          make_id("indeed", url_job),
+                    "source_url":  search_url,
+                    "title":       title,
+                    "company":     company,
+                    "location":    location,
+                    "url":         url_job,
+                    "description": desc,
+                    "date":        date,
+                    "type":        guess_type(title, desc),
+                })
+        except Exception:
+            pass
+
+    # Fallback regex sur les balises <h2> + data-jk
+    if not jobs:
+        jk_blocks = re.findall(
+            r'data-jk="([^"]+)"[^>]*>.*?<span[^>]*>([^<]{3,100})</span>',
+            html, re.DOTALL
+        )
+        seen = set()
+        for jk, title in jk_blocks[:limit]:
+            if jk in seen:
+                continue
+            seen.add(jk)
+            url_job = f"https://fr.indeed.com/viewjob?jk={jk}"
+            jobs.append({
+                "id":          make_id("indeed", url_job),
+                "source_url":  search_url,
+                "title":       title.strip(),
+                "company":     "",
+                "location":    "",
+                "url":         url_job,
+                "description": "",
+                "date":        datetime.now(timezone.utc).isoformat(),
+                "type":        guess_type(title),
+            })
+
+    return jobs[:limit]
+
+
 
 async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
     parsed = urlparse(search_url)
@@ -277,34 +360,44 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     platform = detect_platform(url)
     jobs: list[dict] = []
     error: str | None = None
+    strategy_used: str = "unknown"
 
     try:
         if platform == "indeed":
             try:
                 jobs = await scrape_indeed_rss(url, limit)
-            except Exception:
-                # RSS a échoué (rare) → fallback fetch
-                jobs = await scrape_generic_fetch(url, platform, limit)
+                strategy_used = "rss"
+            except Exception as rss_err:
+                try:
+                    jobs = await scrape_indeed_html(url, limit)
+                    strategy_used = f"html_fallback (rss failed: {rss_err})"
+                except Exception as html_err:
+                    jobs = await scrape_generic_fetch(url, platform, limit)
+                    strategy_used = f"generic_fallback (html failed: {html_err})"
 
         elif platform == "francetravail":
             try:
                 jobs = await scrape_francetravail(url, limit)
+                strategy_used = "francetravail_api"
             except Exception:
                 jobs = await scrape_generic_fetch(url, platform, limit)
+                strategy_used = "generic_fallback"
 
         else:
             jobs = await scrape_generic_fetch(url, platform, limit)
+            strategy_used = "generic_fetch"
 
     except Exception as e:
         error = str(e)
 
     return {
-        "url":       url,
-        "platform":  platform,
-        "jobs":      jobs,
-        "count":     len(jobs),
-        "error":     error,
-        "scrapedAt": datetime.now(timezone.utc).isoformat(),
+        "url":          url,
+        "platform":     platform,
+        "jobs":         jobs,
+        "count":        len(jobs),
+        "error":        error,
+        "strategy":     strategy_used,
+        "scrapedAt":    datetime.now(timezone.utc).isoformat(),
     }
 
 # ── Modèles ────────────────────────────────────────────────────────────────────
