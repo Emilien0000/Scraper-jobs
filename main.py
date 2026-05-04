@@ -121,9 +121,10 @@ def filter_by_category(jobs: list[dict], category: str | None) -> list[dict]:
         re.IGNORECASE
     )
     ALTERNANCE_INDIRECT = re.compile(
-        r"\bbac\s*[+]?\s*[1-6]\b|\bbts\b|\bbut\b|\biut\b|"
-        r"\blicence\s*pro|\bmaster\b|\bmba\b|\bmsc\b|\bbachelor\b|"
-        r"\bcfa\b|\bopco\b|rythme.*entreprise|formation.*entreprise",
+        r"\bcfa\b|\bopco\b|rythme.*entreprise|formation.*entreprise|"
+        r"en\s+alternance|par\s+alternance|contrat\s+pro\b|"
+        r"école.*entreprise|entreprise.*école|école.*alternance|"
+        r"bac\s*[+]\s*[1-5]\s+(?:en\s+)?alternance",
         re.IGNORECASE
     )
     STAGE_RE = re.compile(
@@ -187,7 +188,7 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         location        = location or "France",
         results_wanted  = results_wanted,
         country_indeed  = "france",      # indeed.fr
-        hours_old       = 72,            # offres des 3 derniers jours
+        hours_old       = 240,           # offres des 10 derniers jours (72h trop restrictif)
         description_format = "markdown",
         verbose         = 0,
     )
@@ -349,8 +350,10 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
             try:
                 # 2. On demande à JobSpy de ratisser TRES large (ex: 20 * 8 = 160 offres) 
                 # pour compenser le fait qu'il n'utilise pas le paramètre d'URL exact.
-                fetch_limit = limit * 8 if filter_cat else limit 
-                jobs = await scrape_indeed_jobspy(search_keywords, location, fetch_limit, None)
+                fetch_limit = limit * 8 if filter_cat else limit
+                # FIX : passer job_type à JobSpy pour qu'il filtre aussi côté Indeed
+                jobspy_type = "internship" if filter_cat in ("alternance", "stage") else None
+                jobs = await scrape_indeed_jobspy(search_keywords, location, fetch_limit, jobspy_type)
                 strategy_used = "jobspy_indeed"
                 
                 # On ne lève plus d'erreur ici si c'est vide, on laisse couler vers le filtre final
