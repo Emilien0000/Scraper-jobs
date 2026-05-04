@@ -27,7 +27,7 @@ SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_role key (bypass RLS)
 AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "300"))  # 5 min par défaut
 
-app = FastAPI(title="JobScraper JobSpy v3", version="3.0.0")
+app = FastAPI(title="JobScraper JobSpy v3.1", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -257,6 +257,75 @@ async def scrape_indeed_jobspy(keywords: str, location: str, limit: int, job_typ
     return jobs[:limit]
 
 
+# ── Stratégie LinkedIn : JobSpy → LinkedIn ───────────────────────────────────
+
+def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job_type: str | None) -> list[dict]:
+    """Exécution synchrone de JobSpy pour LinkedIn — à appeler via run_in_executor."""
+    from jobspy import scrape_jobs
+
+    kwargs = dict(
+        site_name          = ["linkedin"],
+        search_term        = keywords,
+        location           = location or "France",
+        results_wanted     = results_wanted,
+        hours_old          = 240,
+        description_format = "markdown",
+        verbose            = 0,
+    )
+    if job_type:
+        kwargs["job_type"] = job_type
+
+    df = scrape_jobs(**kwargs)
+    if df is None or df.empty:
+        return []
+
+    jobs = []
+    for _, row in df.iterrows():
+        title   = str(row.get("title",   "") or "")
+        company = str(row.get("company", "") or "")
+        city    = str(row.get("city",    "") or "")
+        state   = str(row.get("state",   "") or "")
+        loc     = ", ".join(filter(None, [city, state])) or str(row.get("location", "") or "")
+        url_job = str(row.get("job_url", "") or "")
+        desc    = str(row.get("description", "") or "")[:400]
+        date    = safe_date(row.get("date_posted"))
+        jtype   = str(row.get("job_type", "") or "")
+
+        guessed = guess_type(title, desc)
+        if guessed == "alternance":
+            norm_type = "alternance"
+        elif guessed == "stage":
+            norm_type = "stage"
+        elif "intern" in jtype.lower():
+            norm_type = "stage"
+        else:
+            norm_type = "emploi"
+
+        jobs.append({
+            "id":          make_id("linkedin", url_job),
+            "source_url":  "linkedin",
+            "title":       title,
+            "company":     company,
+            "location":    loc,
+            "url":         url_job,
+            "description": desc,
+            "date":        date,
+            "type":        norm_type,
+        })
+    return jobs
+
+
+async def scrape_linkedin_jobspy(keywords: str, location: str, limit: int, job_type: str | None = None) -> list[dict]:
+    """Wrapper async autour de JobSpy LinkedIn."""
+    loop = asyncio.get_event_loop()
+    jobs = await loop.run_in_executor(
+        _executor,
+        _jobspy_linkedin_sync,
+        keywords, location, limit, job_type,
+    )
+    return jobs[:limit]
+
+
 # ── Stratégie 2 : fetch HTML + JSON-LD (fallback générique) ──────────────────
 # Fonctionne pour HelloWork, Adzuna, WTJ, stage.fr, etc.
 
@@ -350,7 +419,18 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     strategy_used = "unknown"
 
     # 1. On extrait la catégorie d'entrée de jeu, pour TOUTES les stratégies
-    _, filter_cat = extract_indeed_jobtype(url) if platform == "indeed" else (None, None)
+    # Extraire la catégorie selon la plateforme
+    if platform == "indeed":
+        _, filter_cat = extract_indeed_jobtype(url)
+    elif platform == "linkedin":
+        if "alternance" in url.lower():
+            filter_cat = "alternance"
+        elif "stage" in url.lower() or "internship" in url.lower():
+            filter_cat = "stage"
+        else:
+            filter_cat = None
+    else:
+        filter_cat = None
 
     try:
         if platform == "indeed":
@@ -374,6 +454,26 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
                 # et le nouveau tls_client passera les sécurités !
                 jobs = await scrape_generic_fetch(url, platform, limit * 4)
                 strategy_used = f"generic_fallback (jobspy failed: {e1})"
+        elif platform == "linkedin":
+            # Détection du job type depuis les paramètres de l'URL LinkedIn
+            # ex: ?f_JT=I (internship), ?f_JT=F (fulltime), ?keywords=...
+            params = parse_qs(urlparse(url).query)
+            jt_param = params.get("f_JT", [""])[0].upper()
+            linkedin_type_map = {"I": "internship", "F": "fulltime", "P": "parttime", "C": "contract", "T": "contract"}
+            jobspy_type = linkedin_type_map.get(jt_param, None)
+
+            # Enrichir les keywords si alternance dans l'URL
+            search_keywords = keywords
+            if "alternance" in url.lower() and "alternance" not in search_keywords.lower():
+                search_keywords += " alternance"
+
+            try:
+                jobs = await scrape_linkedin_jobspy(search_keywords, location, limit * 3, jobspy_type)
+                strategy_used = "jobspy_linkedin"
+            except Exception as e1:
+                jobs = await scrape_generic_fetch(url, platform, limit * 2)
+                strategy_used = f"generic_fallback (linkedin jobspy failed: {e1})"
+
         else:
             # Toutes les autres plateformes
             jobs = await scrape_generic_fetch(url, platform, limit * 2)
@@ -412,7 +512,7 @@ class ScrapeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "job-scraper", "version": "3.0.0", "strategy": "jobspy+jsonld"}
+    return {"status": "ok", "service": "job-scraper", "version": "3.1.0", "strategy": "jobspy_indeed+linkedin+jsonld"}
 
 
 @app.post("/scrape")
