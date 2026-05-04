@@ -1,31 +1,28 @@
-# scraper-service/main.py  v2.0
-# Stratégie anti-détection : RSS (priorité) → fetch direct avec headers réalistes
-# Identique à la logique du repo Liberaa (RSS + user-agent rotatif + fallback fetch)
-# Pas de jobspy/Playwright → pas de timeout 504
+# scraper-service/main.py  v3.0
+# ─────────────────────────────────────────────────────────────────────────────
+# Stratégie principale : JobSpy (python-jobspy) → Indeed France
+#   - tls-client en interne → bypass bot-detection sans proxy
+#   - Fallback : scrape_generic_fetch (JSON-LD) pour les autres plateformes
 #
-# Setup :
-#   pip install fastapi uvicorn httpx feedparser python-dateutil
-#   uvicorn main:app --host 0.0.0.0 --port 8000
+# Install :
+#   pip install fastapi uvicorn httpx feedparser python-dateutil python-jobspy
 #
 # Variable d'environnement :
 #   SCRAPER_SECRET=ton_secret_partage
+# ─────────────────────────────────────────────────────────────────────────────
 
-import os
-import re
-import json
-import random
-import asyncio
-import feedparser
+import os, re, json, random, asyncio
 import httpx
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse, urlencode, urljoin, parse_qs
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dateutil import parser as dateparser
 
-app = FastAPI(title="JobScraper Anti-Detection v2", version="2.0.0")
+app = FastAPI(title="JobScraper JobSpy v3", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,51 +33,54 @@ app.add_middleware(
 
 SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
 
-# ── User-Agents rotatifs (stratégie Liberaa) ──────────────────────────────────
+# Thread pool pour exécuter JobSpy (synchrone) sans bloquer la boucle asyncio
+_executor = ThreadPoolExecutor(max_workers=4)
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
 ]
 
-def random_ua() -> str:
-    return random.choice(USER_AGENTS)
+def random_ua(): return random.choice(USER_AGENTS)
 
-def browser_headers(referer: str = "https://www.google.fr/") -> dict:
-    """Headers imitant un vrai navigateur — clé du bypass anti-bot"""
+def browser_headers(referer="https://www.google.fr/"):
     return {
         "User-Agent": random_ua(),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": referer,
         "DNT": "1",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "cross-site",
-        "Cache-Control": "max-age=0",
     }
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
 def detect_platform(url: str) -> str:
-    if "indeed.com"          in url: return "indeed"
-    if "linkedin.com"        in url: return "linkedin"
-    if "hellowork.com"       in url: return "hellowork"
-    if "stage.fr"            in url: return "stagefr"
-    if "adzuna.fr"           in url: return "adzuna"
-    if "francetravail"       in url: return "francetravail"
-    if "pole-emploi"         in url: return "francetravail"
-    if "labonnealternance"   in url: return "lba"
-    if "welcometothejungle"  in url: return "wtj"
+    if "indeed.com"         in url: return "indeed"
+    if "linkedin.com"       in url: return "linkedin"
+    if "hellowork.com"      in url: return "hellowork"
+    if "welcometothejungle" in url: return "wtj"
+    if "adzuna"             in url: return "adzuna"
+    if "francetravail"      in url: return "francetravail"
+    if "pole-emploi"        in url: return "francetravail"
+    if "labonnealternance"  in url: return "lba"
+    if "stage.fr"           in url: return "stagefr"
     return "generic"
+
+def extract_keywords(url: str) -> str:
+    params = parse_qs(urlparse(url).query)
+    for key in ("q", "motsCles", "keywords", "query", "k", "what"):
+        if params.get(key): return params[key][0]
+    return "développeur"
+
+def extract_location(url: str) -> str:
+    params = parse_qs(urlparse(url).query)
+    for key in ("l", "lieuTravail", "location", "where", "loc"):
+        if params.get(key) and params[key][0]: return params[key][0]
+    return "France"
 
 def guess_type(title: str, description: str = "") -> str:
     text = (title + " " + description).lower()
@@ -89,12 +89,9 @@ def guess_type(title: str, description: str = "") -> str:
     return "emploi"
 
 def safe_date(val) -> str:
-    if not val:
-        return datetime.now(timezone.utc).isoformat()
-    try:
-        return dateparser.parse(str(val)).replace(tzinfo=timezone.utc).isoformat()
-    except Exception:
-        return datetime.now(timezone.utc).isoformat()
+    if not val: return datetime.now(timezone.utc).isoformat()
+    try:    return dateparser.parse(str(val)).replace(tzinfo=timezone.utc).isoformat()
+    except: return datetime.now(timezone.utc).isoformat()
 
 def make_id(platform: str, url: str) -> str:
     return f"{platform}-{abs(hash(url)) % (10**9):09d}"
@@ -102,194 +99,95 @@ def make_id(platform: str, url: str) -> str:
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text or "").strip()
 
-# ── Stratégie 1 : RSS Indeed ──────────────────────────────────────────────────
-# Indeed expose un flux RSS stable (non-documenté mais fiable).
-# C'est la même approche que Liberaa — pas de JS, pas de bot-detection.
 
-def build_indeed_rss(search_url: str) -> str:
-    parsed = urlparse(search_url)
-    params = parse_qs(parsed.query)
-    q  = params.get("q",  ["alternance"])[0]
-    # Ne pas inclure l= vide — Indeed RSS le rejette silencieusement
-    l  = params.get("l",  [None])[0]
-    jt = params.get("jt", [None])[0]
-    rss_params: dict = {"q": q, "format": "rss", "fromage": "14", "sort": "date"}
-    if l:
-        rss_params["l"] = l
-    if jt:
-        rss_params["jt"] = jt
-    base = f"{parsed.scheme}://{parsed.netloc}/rss"
-    return base + "?" + urlencode(rss_params)
+# ── Stratégie 1 : JobSpy → Indeed France ─────────────────────────────────────
+# JobSpy utilise tls-client (fingerprint TLS de vrai navigateur) → bypass
+# la détection bot d'Indeed même depuis une IP datacenter (Render, Railway…).
+# Il tourne en synchrone → on l'exécute dans un ThreadPoolExecutor.
 
-async def scrape_indeed_rss(search_url: str, limit: int = 20) -> list[dict]:
-    rss_url = build_indeed_rss(search_url)
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        r = await client.get(rss_url, headers={
-            "User-Agent": random_ua(),
-            "Accept": "application/rss+xml,application/xml,text/xml,*/*",
-        })
-    r.raise_for_status()
-    feed = feedparser.parse(r.text)
+def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_type: str | None) -> list[dict]:
+    """Exécution synchrone de JobSpy — à appeler via run_in_executor."""
+    from jobspy import scrape_jobs  # import ici pour ne pas planter si absent
 
-    # Feed vide → lever une exception pour déclencher le fallback fetch dans le dispatcher
-    if not feed.entries:
-        raise ValueError(
-            f"Indeed RSS vide (bozo={feed.get('bozo')}, status={getattr(feed, 'status', '?')})"
-        )
+    kwargs = dict(
+        site_name       = ["indeed"],
+        search_term     = keywords,
+        location        = location or "France",
+        results_wanted  = results_wanted,
+        country_indeed  = "FR",          # indeed.fr
+        hours_old       = 72,            # offres des 3 derniers jours
+        description_format = "markdown",
+        verbose         = 0,
+    )
+    if job_type:
+        kwargs["job_type"] = job_type   # "internship", "fulltime", "contract"
+
+    df = scrape_jobs(**kwargs)
+    if df is None or df.empty:
+        return []
 
     jobs = []
-    for entry in feed.entries[:limit]:
-        title   = entry.get("title", "")
-        url_job = entry.get("link",  search_url)
-        desc    = strip_html(entry.get("summary", ""))[:400]
-        date    = safe_date(entry.get("published") or entry.get("updated"))
-        company = ""
-        if hasattr(entry, "source") and isinstance(entry.source, dict):
-            company = entry.source.get("title", "")
-        location = getattr(entry, "indeed_city", "") or ""
-        if not location and entry.get("tags"):
-            location = entry.tags[0].get("term", "")
+    for _, row in df.iterrows():
+        title   = str(row.get("title",   "") or "")
+        company = str(row.get("company", "") or "")
+        city    = str(row.get("city",    "") or "")
+        state   = str(row.get("state",   "") or "")
+        loc     = ", ".join(filter(None, [city, state])) or str(row.get("location", "") or "")
+        url_job = str(row.get("job_url", "") or "")
+        desc    = str(row.get("description", "") or "")[:400]
+        date    = safe_date(row.get("date_posted"))
+        jtype   = str(row.get("job_type", "") or "")
+
+        # Normalise le type JobSpy → nos catégories
+        if "intern" in jtype.lower() or guess_type(title, desc) == "stage":
+            norm_type = "stage"
+        elif guess_type(title, desc) == "alternance":
+            norm_type = "alternance"
+        else:
+            norm_type = "emploi"
+
         jobs.append({
             "id":          make_id("indeed", url_job),
-            "source_url":  search_url,
+            "source_url":  "indeed",
             "title":       title,
             "company":     company,
-            "location":    location,
+            "location":    loc,
             "url":         url_job,
             "description": desc,
             "date":        date,
-            "type":        guess_type(title, desc),
+            "type":        norm_type,
         })
     return jobs
 
-async def scrape_indeed_html(search_url: str, limit: int = 20) -> list[dict]:
-    """
-    Fallback HTML pour Indeed quand le RSS est vide/bloqué.
-    Indeed injecte les offres dans un blob JSON window.mosaic.providerData["mosaic-provider-jobcards"]
-    — on l'extrait sans navigateur headless.
-    """
-    async with httpx.AsyncClient(
-        timeout=25,
-        follow_redirects=True,
-        headers=browser_headers("https://www.google.fr/"),
-    ) as client:
-        r = await client.get(search_url)
 
-    html = r.text
-    jobs = []
+async def scrape_indeed_jobspy(keywords: str, location: str, limit: int) -> list[dict]:
+    """Wrapper async autour de JobSpy."""
+    loop = asyncio.get_event_loop()
+    # Détecte si on cherche alternance/stage pour filtrer côté JobSpy
+    job_type = None
+    kw_lower = keywords.lower()
+    if "stage" in kw_lower or "intern" in kw_lower:
+        job_type = "internship"
 
-    # Indeed injecte les données de résultats dans un JSON global
-    match = re.search(
-        r'window\.mosaic\.providerData\["mosaic-provider-jobcards"\]\s*=\s*(\{.*?\});\s*window\.mosaic',
-        html, re.DOTALL
+    jobs = await loop.run_in_executor(
+        _executor,
+        _jobspy_scrape_sync,
+        keywords, location, limit, job_type,
     )
-    if match:
-        try:
-            data   = json.loads(match.group(1))
-            result = data.get("metaData", {}).get("mosaicProviderJobCardsModel", {})
-            cards  = result.get("results", [])
-            for card in cards[:limit]:
-                title   = card.get("displayTitle") or card.get("title", "")
-                company = card.get("company", "")
-                location= card.get("formattedLocation", "")
-                jk      = card.get("jobkey", "")
-                url_job = f"https://fr.indeed.com/viewjob?jk={jk}" if jk else search_url
-                desc    = strip_html(card.get("snippet", ""))[:400]
-                date    = safe_date(card.get("pubDate") or card.get("createDate"))
-                jobs.append({
-                    "id":          make_id("indeed", url_job),
-                    "source_url":  search_url,
-                    "title":       title,
-                    "company":     company,
-                    "location":    location,
-                    "url":         url_job,
-                    "description": desc,
-                    "date":        date,
-                    "type":        guess_type(title, desc),
-                })
-        except Exception:
-            pass
-
-    # Fallback regex sur les balises <h2> + data-jk
-    if not jobs:
-        jk_blocks = re.findall(
-            r'data-jk="([^"]+)"[^>]*>.*?<span[^>]*>([^<]{3,100})</span>',
-            html, re.DOTALL
-        )
-        seen = set()
-        for jk, title in jk_blocks[:limit]:
-            if jk in seen:
-                continue
-            seen.add(jk)
-            url_job = f"https://fr.indeed.com/viewjob?jk={jk}"
-            jobs.append({
-                "id":          make_id("indeed", url_job),
-                "source_url":  search_url,
-                "title":       title.strip(),
-                "company":     "",
-                "location":    "",
-                "url":         url_job,
-                "description": "",
-                "date":        datetime.now(timezone.utc).isoformat(),
-                "type":        guess_type(title),
-            })
-
     return jobs[:limit]
 
 
-
-async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
-    parsed = urlparse(search_url)
-    params = parse_qs(parsed.query)
-    mots  = params.get("motsCles", params.get("q", ["alternance"]))[0]
-    
-    api_url = "https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search"
-    api_params = {"motsCles": mots, "range": f"0-{min(limit-1, 149)}", "sort": "1"}
-    
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(api_url, params=api_params, headers={
-            "Accept": "application/json",
-            "User-Agent": random_ua(),
-        })
-    data = r.json()
-    offres = data.get("resultats", [])
-    
-    jobs = []
-    for o in offres[:limit]:
-        url_job  = o.get("origineOffre", {}).get("urlOrigine", search_url)
-        title    = o.get("intitule", "")
-        company  = o.get("entreprise", {}).get("nom", "")
-        location = o.get("lieuTravail", {}).get("libelle", "")
-        desc     = (o.get("description", "") or "")[:400]
-        jobs.append({
-            "id":          make_id("francetravail", url_job or o.get("id", "")),
-            "source_url":  search_url,
-            "title":       title,
-            "company":     company,
-            "location":    location,
-            "url":         url_job,
-            "description": desc,
-            "date":        safe_date(o.get("dateCreation")),
-            "type":        guess_type(title, desc),
-        })
-    return jobs
-
-# ── Stratégie 3 : Fetch HTML + JSON-LD (generic) ─────────────────────────────
-# Fonctionne pour HelloWork, Adzuna, Stage.fr, LBA, etc.
-# Extrait les blocs JSON-LD (schéma JobPosting standard) puis fallback regex.
+# ── Stratégie 2 : fetch HTML + JSON-LD (fallback générique) ──────────────────
+# Fonctionne pour HelloWork, Adzuna, WTJ, stage.fr, etc.
 
 async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) -> list[dict]:
-    async with httpx.AsyncClient(
-        timeout=25,
-        follow_redirects=True,
-        headers=browser_headers(),
-    ) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=browser_headers()) as client:
         r = await client.get(search_url)
 
-    html = r.text
-    jobs = []
+    html  = r.text
+    jobs  = []
 
-    # Extraction JSON-LD
+    # Extraction JSON-LD (schéma JobPosting)
     blocks = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL | re.IGNORECASE
@@ -302,16 +200,17 @@ async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) 
                 t = item.get("@type", "")
                 if not isinstance(t, str) or "jobposting" not in t.lower():
                     continue
-                title    = item.get("title", "")
-                url_job  = item.get("url", search_url)
-                desc     = strip_html(item.get("description", ""))[:400]
-                company  = ""
+                title   = item.get("title", "")
+                url_job = item.get("url", search_url)
+                desc    = strip_html(item.get("description", ""))[:400]
+                company = ""
                 if isinstance(item.get("hiringOrganization"), dict):
                     company = item["hiringOrganization"].get("name", "")
                 location = ""
                 if isinstance(item.get("jobLocation"), dict):
                     addr = item["jobLocation"].get("address", {})
-                    location = addr.get("addressLocality", "") if isinstance(addr, dict) else str(addr)
+                    if isinstance(addr, dict):
+                        location = addr.get("addressLocality", "")
                 jobs.append({
                     "id":          make_id(platform, url_job),
                     "source_url":  search_url,
@@ -323,20 +222,17 @@ async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) 
                     "date":        safe_date(item.get("datePosted")),
                     "type":        guess_type(title, desc),
                 })
-                if len(jobs) >= limit:
-                    break
+                if len(jobs) >= limit: break
         except Exception:
             continue
-        if len(jobs) >= limit:
-            break
+        if len(jobs) >= limit: break
 
     # Fallback heuristique si pas de JSON-LD
     if not jobs:
         links = re.findall(r'href=["\'](/(?:emploi|job|offre|annonce|recherche|poste)[^"\']{5,})["\']', html)
-        seen = set()
+        seen  = set()
         for path in links:
-            if path in seen or len(jobs) >= limit:
-                break
+            if path in seen or len(jobs) >= limit: break
             seen.add(path)
             full_url = urljoin(search_url, path)
             label    = path.split("/")[-1].replace("-", " ").replace("_", " ").strip()[:80].title()
@@ -344,46 +240,44 @@ async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) 
                 "id":          make_id(platform, full_url),
                 "source_url":  search_url,
                 "title":       label or "Offre",
-                "company":     "",
-                "location":    "",
-                "url":         full_url,
-                "description": "",
+                "company":     "", "location":    "",
+                "url":         full_url, "description": "",
                 "date":        datetime.now(timezone.utc).isoformat(),
                 "type":        guess_type(label),
             })
 
     return jobs[:limit]
 
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 async def scrape_url(url: str, limit: int = 20) -> dict:
-    platform = detect_platform(url)
-    jobs: list[dict] = []
-    error: str | None = None
-    strategy_used: str = "unknown"
+    platform      = detect_platform(url)
+    keywords      = extract_keywords(url)
+    location      = extract_location(url)
+    jobs: list    = []
+    error         = None
+    strategy_used = "unknown"
 
     try:
         if platform == "indeed":
+            # ── Priorité : JobSpy (tls-client, bypass Indeed) ──
             try:
-                jobs = await scrape_indeed_rss(url, limit)
-                strategy_used = "rss"
-            except Exception as rss_err:
+                jobs = await scrape_indeed_jobspy(keywords, location, limit)
+                strategy_used = "jobspy_indeed"
+                if not jobs:
+                    raise ValueError("JobSpy a retourné 0 résultat")
+            except Exception as e1:
+                # Fallback générique (peu de chances de marcher sur Indeed
+                # mais on essaie quand même)
                 try:
-                    jobs = await scrape_indeed_html(url, limit)
-                    strategy_used = f"html_fallback (rss failed: {rss_err})"
-                except Exception as html_err:
                     jobs = await scrape_generic_fetch(url, platform, limit)
-                    strategy_used = f"generic_fallback (html failed: {html_err})"
-
-        elif platform == "francetravail":
-            try:
-                jobs = await scrape_francetravail(url, limit)
-                strategy_used = "francetravail_api"
-            except Exception:
-                jobs = await scrape_generic_fetch(url, platform, limit)
-                strategy_used = "generic_fallback"
+                    strategy_used = f"generic_fallback (jobspy failed: {e1})"
+                except Exception as e2:
+                    raise RuntimeError(f"jobspy: {e1} | generic: {e2}")
 
         else:
+            # Toutes les autres plateformes : fetch JSON-LD
             jobs = await scrape_generic_fetch(url, platform, limit)
             strategy_used = "generic_fetch"
 
@@ -391,26 +285,29 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
         error = str(e)
 
     return {
-        "url":          url,
-        "platform":     platform,
-        "jobs":         jobs,
-        "count":        len(jobs),
-        "error":        error,
-        "strategy":     strategy_used,
-        "scrapedAt":    datetime.now(timezone.utc).isoformat(),
+        "url":       url,
+        "platform":  platform,
+        "jobs":      jobs,
+        "count":     len(jobs),
+        "error":     error,
+        "strategy":  strategy_used,
+        "scrapedAt": datetime.now(timezone.utc).isoformat(),
     }
 
-# ── Modèles ────────────────────────────────────────────────────────────────────
+
+# ── Modèles ───────────────────────────────────────────────────────────────────
 
 class ScrapeRequest(BaseModel):
-    urls: list[str]
+    urls:           list[str]
     results_wanted: int = 20
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "job-scraper", "version": "2.0.0", "strategy": "rss+fetch+jsonld"}
+    return {"status": "ok", "service": "job-scraper", "version": "3.0.0", "strategy": "jobspy+jsonld"}
+
 
 @app.post("/scrape")
 async def scrape_post(
@@ -422,7 +319,6 @@ async def scrape_post(
     if not body.urls:
         raise HTTPException(status_code=400, detail="urls requis")
 
-    # Toutes les URLs en parallèle
     results = list(await asyncio.gather(*[scrape_url(u, body.results_wanted) for u in body.urls]))
     errors  = [{"url": r["url"], "error": r["error"]} for r in results if r["error"]]
 
@@ -433,12 +329,13 @@ async def scrape_post(
         "total":   sum(r["count"] for r in results),
     }
 
+
 @app.get("/scrape")
 async def scrape_get(
     url: str = Query(...),
     x_scraper_secret: Optional[str] = Header(default=None),
 ):
-    """Debug : GET /scrape?url=https://fr.indeed.com/jobs?q=alternance"""
+    """Debug : GET /scrape?url=https://fr.indeed.com/jobs?q=développeur"""
     if SCRAPER_SECRET and x_scraper_secret != SCRAPER_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     result = await scrape_url(url, 10)
