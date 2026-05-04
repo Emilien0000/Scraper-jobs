@@ -8,7 +8,7 @@
 #   pip install fastapi uvicorn httpx feedparser python-dateutil python-jobspy
 #
 # Variable d'environnement :
-#   SCRAPER_SECRET=ton_secret_partage
+#   SCRAPER_SECRET=ton_secret_partagefsss
 # ─────────────────────────────────────────────────────────────────────────────
 import tls_client
 import os, re, json, random, asyncio
