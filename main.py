@@ -10,7 +10,7 @@
 # Variable d'environnement :
 #   SCRAPER_SECRET=ton_secret_partage
 # ─────────────────────────────────────────────────────────────────────────────
-
+import tls_client
 import os, re, json, random, asyncio
 import httpx
 from datetime import datetime, timezone
@@ -248,11 +248,21 @@ async def scrape_indeed_jobspy(keywords: str, location: str, limit: int, job_typ
 # Fonctionne pour HelloWork, Adzuna, WTJ, stage.fr, etc.
 
 async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) -> list[dict]:
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=browser_headers()) as client:
-        r = await client.get(search_url)
-
-    html  = r.text
-    jobs  = []
+    # Remplacement de httpx par tls_client pour bypasser Cloudflare/Indeed comme le fait JobSpy
+    session = tls_client.Session(
+        client_identifier="chrome_124",
+        random_tls_extension_order=True
+    )
+    
+    # tls_client est synchrone, on l'exécute dans l'executor pour ne pas bloquer FastAPI
+    loop = asyncio.get_event_loop()
+    r = await loop.run_in_executor(
+        None, 
+        lambda: session.get(search_url, headers=browser_headers())
+    )
+    
+    html = r.text
+    jobs = []
 
     # Extraction JSON-LD (schéma JobPosting)
     blocks = re.findall(
@@ -326,41 +336,49 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     error         = None
     strategy_used = "unknown"
 
+    # 1. On extrait la catégorie d'entrée de jeu, pour TOUTES les stratégies
+    _, filter_cat = extract_indeed_jobtype(url) if platform == "indeed" else (None, None)
+
     try:
         if platform == "indeed":
-            # ── Priorité : JobSpy (tls-client, bypass Indeed) ──
-            indeed_jt, filter_cat = extract_indeed_jobtype(url)
+            search_keywords = keywords
+            # Forcer le mot pour aider JobSpy
+            if filter_cat == "alternance" and "alternance" not in search_keywords.lower():
+                search_keywords += " alternance"
+            
             try:
-                # On demande plus de résultats pour compenser le post-filtrage
-                fetch_limit = limit * 6 if filter_cat else limit  # sur-scrape pour compenser le post-filtrage
-                jobs = await scrape_indeed_jobspy(keywords, location, fetch_limit, indeed_jt)
-                if filter_cat:
-                    jobs = filter_by_category(jobs, filter_cat)[:limit]
-                strategy_used = f"jobspy_indeed (filter={filter_cat or 'none'})"
-                if not jobs:
-                    raise ValueError("JobSpy a retourné 0 résultat après filtrage")
+                # 2. On demande à JobSpy de ratisser TRES large (ex: 20 * 8 = 160 offres) 
+                # pour compenser le fait qu'il n'utilise pas le paramètre d'URL exact.
+                fetch_limit = limit * 8 if filter_cat else limit 
+                jobs = await scrape_indeed_jobspy(search_keywords, location, fetch_limit, None)
+                strategy_used = "jobspy_indeed"
+                
+                # On ne lève plus d'erreur ici si c'est vide, on laisse couler vers le filtre final
             except Exception as e1:
-                # Fallback générique (peu de chances de marcher sur Indeed
-                # mais on essaie quand même)
-                try:
-                    jobs = await scrape_generic_fetch(url, platform, limit)
-                    strategy_used = f"generic_fallback (jobspy failed: {e1})"
-                except Exception as e2:
-                    raise RuntimeError(f"jobspy: {e1} | generic: {e2}")
-
+                # Si JobSpy plante sec, le fallback va utiliser la VRAIE URL avec le paramètre sc=... 
+                # et le nouveau tls_client passera les sécurités !
+                jobs = await scrape_generic_fetch(url, platform, limit * 4)
+                strategy_used = f"generic_fallback (jobspy failed: {e1})"
         else:
-            # Toutes les autres plateformes : fetch JSON-LD
-            jobs = await scrape_generic_fetch(url, platform, limit)
+            # Toutes les autres plateformes
+            jobs = await scrape_generic_fetch(url, platform, limit * 2)
             strategy_used = "generic_fetch"
 
     except Exception as e:
         error = str(e)
 
+    # 3. LE BLINDAGE FINAL : On post-filtre systématiquement ici, peu importe la stratégie !
+    if filter_cat:
+        jobs = filter_by_category(jobs, filter_cat)
+
+    # On s'assure de ne renvoyer que la limite demandée (20)
+    final_jobs = jobs[:limit]
+
     return {
         "url":       url,
         "platform":  platform,
-        "jobs":      jobs,
-        "count":     len(jobs),
+        "jobs":      final_jobs,
+        "count":     len(final_jobs),
         "error":     error,
         "strategy":  strategy_used,
         "scrapedAt": datetime.now(timezone.utc).isoformat(),
