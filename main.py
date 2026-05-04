@@ -114,7 +114,7 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         search_term     = keywords,
         location        = location or "France",
         results_wanted  = results_wanted,
-        country_indeed  = "FR",          # indeed.fr
+        country_indeed  = "france",      # indeed.fr
         hours_old       = 72,            # offres des 3 derniers jours
         description_format = "markdown",
         verbose         = 0,
