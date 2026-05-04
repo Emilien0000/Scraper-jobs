@@ -22,6 +22,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dateutil import parser as dateparser
 
+# Supabase REST client (léger, sans supabase-py)
+SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY    = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_role key (bypass RLS)
+AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "300"))  # 5 min par défaut
+
 app = FastAPI(title="JobScraper JobSpy v3", version="3.0.0")
 
 app.add_middleware(
@@ -440,6 +445,190 @@ async def scrape_get(
         raise HTTPException(status_code=401, detail="Unauthorized")
     result = await scrape_url(url, 10)
     return {"ok": True, "results": [result], "errors": [], "total": result["count"]}
+
+
+# ── Auto-scraper background ───────────────────────────────────────────────────
+# Toutes les AUTO_SCRAPE_INTERVAL secondes (défaut 300 = 5 min) :
+#   1. Lit la table user_filters dans Supabase pour récupérer tous les liens actifs
+#   2. Scrappe chaque URL unique (dédupliquée entre users)
+#   3. Upsert les offres dans jb_jobs
+#   4. Met à jour lastScraped + jobCount dans user_filters pour chaque user
+
+async def _supabase_get(path: str) -> list[dict]:
+    """Lecture REST Supabase (service role)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Accept":        "application/json",
+            }
+        )
+        r.raise_for_status()
+        return r.json()
+
+async def _supabase_upsert(table: str, rows: list[dict], on_conflict: str = "id") -> None:
+    """Upsert REST Supabase (service role)."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not rows:
+        return
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={
+                "apikey":         SUPABASE_KEY,
+                "Authorization":  f"Bearer {SUPABASE_KEY}",
+                "Content-Type":   "application/json",
+                "Prefer":         f"resolution=merge-duplicates,return=minimal",
+            },
+            params={"on_conflict": on_conflict},
+            json=rows,
+        )
+        r.raise_for_status()
+
+async def _supabase_patch(table: str, row_id: str, patch: dict) -> None:
+    """PATCH d'une ligne Supabase (service role)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            params={"id": f"eq.{row_id}"},
+            json=patch,
+        )
+        r.raise_for_status()
+
+def _normalize_date(val) -> str:
+    if not val:
+        return datetime.now(timezone.utc).isoformat()
+    try:
+        return dateparser.parse(str(val)).replace(tzinfo=timezone.utc).isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
+
+async def auto_scrape_cycle() -> None:
+    """Un cycle complet d'auto-scrape pour tous les users."""
+    print(f"[auto-scrape] Début cycle — {datetime.now(timezone.utc).isoformat()}")
+    try:
+        # 1. Lire tous les user_filters
+        rows = await _supabase_get("user_filters?select=id,filters")
+    except Exception as e:
+        print(f"[auto-scrape] ❌ Lecture user_filters: {e}")
+        return
+
+    # 2. Construire la map url → liste de (userId, filterIndex)
+    url_to_users: dict[str, list[tuple[str, int]]] = {}
+    for row in rows:
+        filters = row.get("filters") or []
+        if not isinstance(filters, list):
+            continue
+        for idx, f in enumerate(filters):
+            if isinstance(f, dict) and f.get("enabled") and f.get("url"):
+                url = f["url"]
+                url_to_users.setdefault(url, []).append((row["id"], idx))
+
+    if not url_to_users:
+        print("[auto-scrape] Aucun lien actif trouvé.")
+        return
+
+    print(f"[auto-scrape] {len(url_to_users)} URL(s) unique(s) à scraper pour {len(rows)} user(s)")
+
+    # 3. Scraper toutes les URLs uniques (en parallèle, max 5 à la fois)
+    sem = asyncio.Semaphore(5)
+    scrape_results: dict[str, dict] = {}
+
+    async def scrape_one(url: str):
+        async with sem:
+            try:
+                result = await scrape_url(url, limit=20)
+                scrape_results[url] = result
+                print(f"[auto-scrape] ✅ {url[:60]}… → {result['count']} offres")
+            except Exception as e:
+                print(f"[auto-scrape] ❌ {url[:60]}… : {e}")
+                scrape_results[url] = {"url": url, "jobs": [], "count": 0, "error": str(e), "scrapedAt": datetime.now(timezone.utc).isoformat()}
+
+    await asyncio.gather(*[scrape_one(u) for u in url_to_users])
+
+    # 4. Upsert tous les jobs dans jb_jobs
+    all_jobs = []
+    seen_urls = set()
+    for result in scrape_results.values():
+        for job in (result.get("jobs") or []):
+            if job.get("url") and job["url"] not in seen_urls:
+                seen_urls.add(job["url"])
+                all_jobs.append({
+                    "id":          job.get("id") or f"auto-{abs(hash(job['url'])) % (10**9):09d}",
+                    "source_url":  job.get("source_url", ""),
+                    "title":       job.get("title", "(sans titre)"),
+                    "company":     job.get("company", ""),
+                    "location":    job.get("location", ""),
+                    "url":         job["url"],
+                    "description": job.get("description", ""),
+                    "date":        _normalize_date(job.get("date")),
+                    "type":        job.get("type", "emploi"),
+                })
+
+    if all_jobs:
+        try:
+            # Upsert par batch de 50 pour éviter les limites de payload
+            batch_size = 50
+            for i in range(0, len(all_jobs), batch_size):
+                await _supabase_upsert("jb_jobs", all_jobs[i:i+batch_size], on_conflict="url")
+            print(f"[auto-scrape] 💾 {len(all_jobs)} offres upsertées dans jb_jobs")
+        except Exception as e:
+            print(f"[auto-scrape] ❌ Upsert jb_jobs: {e}")
+
+    # 5. Mettre à jour lastScraped + jobCount dans user_filters pour chaque user
+    for row in rows:
+        filters = row.get("filters") or []
+        if not isinstance(filters, list):
+            continue
+        updated = False
+        for idx, f in enumerate(filters):
+            if isinstance(f, dict) and f.get("enabled") and f.get("url"):
+                url = f["url"]
+                if url in scrape_results:
+                    res = scrape_results[url]
+                    filters[idx]["lastScraped"] = res.get("scrapedAt", datetime.now(timezone.utc).isoformat())
+                    filters[idx]["jobCount"]    = res.get("count", 0)
+                    updated = True
+        if updated:
+            try:
+                await _supabase_patch("user_filters", row["id"], {"filters": filters})
+            except Exception as e:
+                print(f"[auto-scrape] ❌ Patch user_filters {row['id']}: {e}")
+
+    print(f"[auto-scrape] ✅ Cycle terminé — {len(all_jobs)} offres insérées.")
+
+
+async def auto_scrape_loop() -> None:
+    """Boucle infinie qui lance un cycle toutes les AUTO_SCRAPE_INTERVAL secondes."""
+    # Attendre 30s au démarrage pour laisser l'appli se stabiliser
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await auto_scrape_cycle()
+        except Exception as e:
+            print(f"[auto-scrape] ❌ Erreur inattendue dans le cycle: {e}")
+        await asyncio.sleep(AUTO_SCRAPE_INTERVAL)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Lance le scheduler background au démarrage de FastAPI."""
+    if SUPABASE_URL and SUPABASE_KEY:
+        asyncio.create_task(auto_scrape_loop())
+        print(f"[auto-scrape] 🚀 Scheduler démarré — cycle toutes les {AUTO_SCRAPE_INTERVAL}s")
+    else:
+        print("[auto-scrape] ⚠️  SUPABASE_URL / SUPABASE_SERVICE_KEY non définis — scheduler désactivé")
 
 
 if __name__ == "__main__":
