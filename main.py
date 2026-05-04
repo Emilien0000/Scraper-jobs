@@ -157,8 +157,9 @@ def filter_by_category(jobs: list[dict], category: str | None) -> list[dict]:
 
 def guess_type(title: str, description: str = "") -> str:
     text = (title + " " + description).lower()
-    if re.search(r"alternance|apprentissage|contrat pro", text): return "alternance"
-    if re.search(r"stage|intern|internship",               text): return "stage"
+    # Alternance EN PREMIER — sinon "stage en alternance" serait classé stage
+    if re.search(r"alternance|alternant|apprentissage|contrat pro|contrat d.alternance", text): return "alternance"
+    if re.search(r"\bstage\b|stagiaire|intern\b|internship", text): return "stage"
     return "emploi"
 
 def safe_date(val) -> str:
@@ -212,10 +213,16 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         jtype   = str(row.get("job_type", "") or "")
 
         # Normalise le type JobSpy → nos catégories
-        if "intern" in jtype.lower() or guess_type(title, desc) == "stage":
-            norm_type = "stage"
-        elif guess_type(title, desc) == "alternance":
+        # IMPORTANT : on check alternance EN PREMIER car JobSpy retourne "internship"
+        # pour TOUT (stages ET alternances) — le texte est le seul signal fiable.
+        guessed = guess_type(title, desc)
+        if guessed == "alternance":
             norm_type = "alternance"
+        elif guessed == "stage":
+            norm_type = "stage"
+        elif "intern" in jtype.lower():
+            # JobSpy dit internship mais le texte ne tranché pas → stage par défaut
+            norm_type = "stage"
         else:
             norm_type = "emploi"
 
