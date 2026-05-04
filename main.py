@@ -82,6 +82,20 @@ def extract_location(url: str) -> str:
         if params.get(key) and params[key][0]: return params[key][0]
     return "France"
 
+def extract_indeed_jobtype(url: str) -> str | None:
+    """
+    Lit le parametre sc= d'une URL Indeed pour detecter le filtre contrat.
+    CPAHG = Alternance, QADT5 = Apprentissage -> "internship" cote JobSpy.
+    """
+    params = parse_qs(urlparse(url).query)
+    sc = params.get("sc", [""])[0]
+    jt = params.get("jt", [""])[0]
+    if any(code in sc for code in ("CPAHG", "QADT5")):
+        return "internship"
+    if jt in ("internship", "contract", "fulltime", "parttime"):
+        return jt
+    return None
+
 def guess_type(title: str, description: str = "") -> str:
     text = (title + " " + description).lower()
     if re.search(r"alternance|apprentissage|contrat pro", text): return "alternance"
@@ -160,14 +174,9 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
     return jobs
 
 
-async def scrape_indeed_jobspy(keywords: str, location: str, limit: int) -> list[dict]:
+async def scrape_indeed_jobspy(keywords: str, location: str, limit: int, job_type: str | None = None) -> list[dict]:
     """Wrapper async autour de JobSpy."""
     loop = asyncio.get_event_loop()
-    # Détecte si on cherche alternance/stage pour filtrer côté JobSpy
-    job_type = None
-    kw_lower = keywords.lower()
-    if "stage" in kw_lower or "intern" in kw_lower:
-        job_type = "internship"
 
     jobs = await loop.run_in_executor(
         _executor,
@@ -262,8 +271,9 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     try:
         if platform == "indeed":
             # ── Priorité : JobSpy (tls-client, bypass Indeed) ──
+            indeed_jt = extract_indeed_jobtype(url)
             try:
-                jobs = await scrape_indeed_jobspy(keywords, location, limit)
+                jobs = await scrape_indeed_jobspy(keywords, location, limit, indeed_jt)
                 strategy_used = "jobspy_indeed"
                 if not jobs:
                     raise ValueError("JobSpy a retourné 0 résultat")
