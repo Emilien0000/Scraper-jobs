@@ -449,9 +449,12 @@ async def scrape_post(
                     })
         if jobs_to_insert:
             try:
+                # Purge les anciens jobs de cet user avant d'insérer les nouveaux
+                await _supabase_delete("jb_jobs", body.user_id)
+                print(f"[scrape] 🗑️  Anciens jobs purgés pour user {body.user_id[:8]}…")
                 for i in range(0, len(jobs_to_insert), 50):
                     await _supabase_upsert("jb_jobs", jobs_to_insert[i:i+50], on_conflict="user_id,url")
-                print(f"[scrape] 💾 {len(jobs_to_insert)} offres upsertées pour user {body.user_id[:8]}…")
+                print(f"[scrape] 💾 {len(jobs_to_insert)} offres insérées pour user {body.user_id[:8]}…")
             except Exception as e:
                 print(f"[scrape] ❌ Upsert erreur: {e}")
 
@@ -513,6 +516,22 @@ async def _supabase_upsert(table: str, rows: list[dict], on_conflict: str = "id"
             },
             params={"on_conflict": on_conflict},
             json=rows,
+        )
+        r.raise_for_status()
+
+async def _supabase_delete(table: str, user_id: str) -> None:
+    """Supprime tous les jobs d un user (DELETE REST Supabase, service role)."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not user_id:
+        return
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Prefer":        "return=minimal",
+            },
+            params={"user_id": f"eq.{user_id}"},
         )
         r.raise_for_status()
 
