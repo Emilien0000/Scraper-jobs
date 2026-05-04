@@ -405,6 +405,7 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
 class ScrapeRequest(BaseModel):
     urls:           list[str]
     results_wanted: int = 20
+    user_id:        Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -426,6 +427,33 @@ async def scrape_post(
 
     results = list(await asyncio.gather(*[scrape_url(u, body.results_wanted) for u in body.urls]))
     errors  = [{"url": r["url"], "error": r["error"]} for r in results if r["error"]]
+
+    # Si un user_id est fourni, on upsert directement dans Supabase avec user_id
+    if body.user_id and SUPABASE_URL and SUPABASE_KEY:
+        jobs_to_insert = []
+        seen = set()
+        for result in results:
+            for job in (result.get("jobs") or []):
+                if job.get("url") and job["url"] not in seen:
+                    seen.add(job["url"])
+                    jobs_to_insert.append({
+                        "user_id":     body.user_id,
+                        "source_url":  job.get("source_url", ""),
+                        "title":       job.get("title", "(sans titre)"),
+                        "company":     job.get("company", ""),
+                        "location":    job.get("location", ""),
+                        "url":         job["url"],
+                        "description": job.get("description", ""),
+                        "date":        _normalize_date(job.get("date")),
+                        "type":        job.get("type", "emploi"),
+                    })
+        if jobs_to_insert:
+            try:
+                for i in range(0, len(jobs_to_insert), 50):
+                    await _supabase_upsert("jb_jobs", jobs_to_insert[i:i+50], on_conflict="user_id,url")
+                print(f"[scrape] 💾 {len(jobs_to_insert)} offres upsertées pour user {body.user_id[:8]}…")
+            except Exception as e:
+                print(f"[scrape] ❌ Upsert erreur: {e}")
 
     return {
         "ok":      True,
@@ -557,34 +585,50 @@ async def auto_scrape_cycle() -> None:
 
     await asyncio.gather(*[scrape_one(u) for u in url_to_users])
 
-    # 4. Upsert tous les jobs dans jb_jobs
-    all_jobs = []
-    seen_urls = set()
-    for result in scrape_results.values():
-        for job in (result.get("jobs") or []):
-            if job.get("url") and job["url"] not in seen_urls:
-                seen_urls.add(job["url"])
-                all_jobs.append({
-                    "id":          job.get("id") or f"auto-{abs(hash(job['url'])) % (10**9):09d}",
-                    "source_url":  job.get("source_url", ""),
-                    "title":       job.get("title", "(sans titre)"),
-                    "company":     job.get("company", ""),
-                    "location":    job.get("location", ""),
-                    "url":         job["url"],
-                    "description": job.get("description", ""),
-                    "date":        _normalize_date(job.get("date")),
-                    "type":        job.get("type", "emploi"),
-                })
+    # 4. Upsert les jobs dans jb_jobs — UN PAR USER pour respecter l isolation
+    total_inserted = 0
+    for row in rows:
+        user_id = row["id"]
+        filters = row.get("filters") or []
+        if not isinstance(filters, list):
+            continue
 
-    if all_jobs:
-        try:
-            # Upsert par batch de 50 pour éviter les limites de payload
-            batch_size = 50
-            for i in range(0, len(all_jobs), batch_size):
-                await _supabase_upsert("jb_jobs", all_jobs[i:i+batch_size], on_conflict="url")
-            print(f"[auto-scrape] 💾 {len(all_jobs)} offres upsertées dans jb_jobs")
-        except Exception as e:
-            print(f"[auto-scrape] ❌ Upsert jb_jobs: {e}")
+        user_urls = {f["url"] for f in filters if isinstance(f, dict) and f.get("enabled") and f.get("url")}
+        if not user_urls:
+            continue
+
+        user_jobs = []
+        seen_for_user = set()
+        for url in user_urls:
+            result = scrape_results.get(url)
+            if not result:
+                continue
+            for job in (result.get("jobs") or []):
+                if job.get("url") and job["url"] not in seen_for_user:
+                    seen_for_user.add(job["url"])
+                    user_jobs.append({
+                        "user_id":     user_id,
+                        "source_url":  job.get("source_url", ""),
+                        "title":       job.get("title", "(sans titre)"),
+                        "company":     job.get("company", ""),
+                        "location":    job.get("location", ""),
+                        "url":         job["url"],
+                        "description": job.get("description", ""),
+                        "date":        _normalize_date(job.get("date")),
+                        "type":        job.get("type", "emploi"),
+                    })
+
+        if user_jobs:
+            try:
+                batch_size = 50
+                for i in range(0, len(user_jobs), batch_size):
+                    await _supabase_upsert("jb_jobs", user_jobs[i:i+batch_size], on_conflict="user_id,url")
+                total_inserted += len(user_jobs)
+                print(f"[auto-scrape] 💾 {len(user_jobs)} offres upsertées pour user {user_id[:8]}…")
+            except Exception as e:
+                print(f"[auto-scrape] ❌ Upsert jb_jobs user {user_id[:8]}: {e}")
+
+    print(f"[auto-scrape] 💾 Total : {total_inserted} offres insérées.")
 
     # 5. Mettre à jour lastScraped + jobCount dans user_filters pour chaque user
     for row in rows:
@@ -606,7 +650,7 @@ async def auto_scrape_cycle() -> None:
             except Exception as e:
                 print(f"[auto-scrape] ❌ Patch user_filters {row['id']}: {e}")
 
-    print(f"[auto-scrape] ✅ Cycle terminé — {len(all_jobs)} offres insérées.")
+    print(f"[auto-scrape] ✅ Cycle terminé — {total_inserted} offres insérées.")
 
 
 async def auto_scrape_loop() -> None:
