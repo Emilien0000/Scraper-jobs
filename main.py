@@ -438,7 +438,7 @@ async def scrape_post(
                     seen.add(job["url"])
                     jobs_to_insert.append({
                         "user_id":     body.user_id,
-                        "source_url":  job.get("source_url", ""),
+                        "source_url":  result.get("url", ""), 
                         "title":       job.get("title", "(sans titre)"),
                         "company":     job.get("company", ""),
                         "location":    job.get("location", ""),
@@ -627,7 +627,7 @@ async def auto_scrape_cycle() -> None:
                     seen_for_user.add(job["url"])
                     user_jobs.append({
                         "user_id":     user_id,
-                        "source_url":  job.get("source_url", ""),
+                        "source_url":  url,
                         "title":       job.get("title", "(sans titre)"),
                         "company":     job.get("company", ""),
                         "location":    job.get("location", ""),
