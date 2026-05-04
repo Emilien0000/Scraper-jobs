@@ -82,19 +82,59 @@ def extract_location(url: str) -> str:
         if params.get(key) and params[key][0]: return params[key][0]
     return "France"
 
-def extract_indeed_jobtype(url: str) -> str | None:
+def extract_indeed_jobtype(url: str) -> tuple[str | None, str | None]:
     """
-    Lit le parametre sc= d'une URL Indeed pour detecter le filtre contrat.
-    CPAHG = Alternance, QADT5 = Apprentissage -> "internship" cote JobSpy.
+    Lit les paramètres sc= et jt= d'une URL Indeed.
+    Retourne (jobspy_type, filter_category) :
+      - jobspy_type   : valeur passée à JobSpy (hint de recherche, peu fiable)
+      - filter_category : catégorie à enforcer en post-filtrage
+          "alternance" → on ne garde que les offres alternance/apprentissage
+          "stage"      → on ne garde que les stages
+          None         → pas de post-filtrage
     """
     params = parse_qs(urlparse(url).query)
     sc = params.get("sc", [""])[0]
     jt = params.get("jt", [""])[0]
+
+    # Codes Indeed identifiés : CPAHG=Alternance, QADT5=Apprentissage
     if any(code in sc for code in ("CPAHG", "QADT5")):
-        return "internship"
-    if jt in ("internship", "contract", "fulltime", "parttime"):
-        return jt
-    return None
+        return ("internship", "alternance")
+    if "internship" in sc.lower() or jt == "internship":
+        return ("internship", "stage")
+    if jt in ("contract", "fulltime", "parttime"):
+        return (jt, None)
+    return (None, None)
+
+
+def filter_by_category(jobs: list[dict], category: str | None) -> list[dict]:
+    """
+    Post-filtre les offres selon la catégorie voulue.
+    Indispensable car JobSpy ne respecte pas toujours les filtres Indeed.
+    """
+    if not category:
+        return jobs
+
+    ALTERNANCE_RE = re.compile(
+        r"alternance|apprentissage|contrat d.apprentissage|contrat pro|"
+        r"en alternance|par alternance|bachelor.*alternance|master.*alternance|"
+        r"bts.*alternance|alternant",
+        re.IGNORECASE
+    )
+    STAGE_RE = re.compile(
+        r"stage|stagiaire|internship|intern",
+        re.IGNORECASE
+    )
+
+    filtered = []
+    for job in jobs:
+        text = f"{job.get('title','')} {job.get('description','')} {job.get('type','')}"
+        if category == "alternance" and ALTERNANCE_RE.search(text):
+            job["type"] = "alternance"
+            filtered.append(job)
+        elif category == "stage" and STAGE_RE.search(text):
+            job["type"] = "stage"
+            filtered.append(job)
+    return filtered
 
 def guess_type(title: str, description: str = "") -> str:
     text = (title + " " + description).lower()
@@ -271,12 +311,16 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     try:
         if platform == "indeed":
             # ── Priorité : JobSpy (tls-client, bypass Indeed) ──
-            indeed_jt = extract_indeed_jobtype(url)
+            indeed_jt, filter_cat = extract_indeed_jobtype(url)
             try:
-                jobs = await scrape_indeed_jobspy(keywords, location, limit, indeed_jt)
-                strategy_used = "jobspy_indeed"
+                # On demande plus de résultats pour compenser le post-filtrage
+                fetch_limit = limit * 4 if filter_cat else limit
+                jobs = await scrape_indeed_jobspy(keywords, location, fetch_limit, indeed_jt)
+                if filter_cat:
+                    jobs = filter_by_category(jobs, filter_cat)
+                strategy_used = f"jobspy_indeed (filter={filter_cat or 'none'})"
                 if not jobs:
-                    raise ValueError("JobSpy a retourné 0 résultat")
+                    raise ValueError("JobSpy a retourné 0 résultat après filtrage")
             except Exception as e1:
                 # Fallback générique (peu de chances de marcher sur Indeed
                 # mais on essaie quand même)
