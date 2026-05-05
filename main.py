@@ -364,8 +364,8 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
     if df is None or df.empty:
         return []
 
-    # ── Étape 1 : construire la liste de jobs sans is_direct ─────────────────
-    raw_jobs = []
+    jobs = []
+    easy_count = 0
     for _, row in df.iterrows():
         title   = str(row.get("title",   "") or "")
         company = str(row.get("company", "") or "")
@@ -376,6 +376,35 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         desc    = str(row.get("description", "") or "")[:400]
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
+
+        # ── Détection Easy Apply via job_url_direct de JobSpy ────────────────
+        # JobSpy remplit job_url_direct avec l'URL de candidature externe de l'employeur.
+        # Règle :
+        #   - vide / NaN / None           → pas d'URL externe → Indeed Apply ✅
+        #   - contient "indeed.com"        → redirection interne Indeed → Indeed Apply ✅
+        #   - URL externe (lever, greenhouse…) → candidature externe → pas Easy Apply ❌
+        #
+        # is_direct_apply est presque toujours NaN chez JobSpy, on l'ignore.
+        job_url_direct = row.get("job_url_direct")
+        url_direct_str = str(job_url_direct).strip() if job_url_direct is not None else ""
+        EMPTY = {"", "nan", "none", "n/a", "null"}
+
+        if url_direct_str.lower() in EMPTY:
+            # Pas d'URL externe → Easy Apply
+            is_direct = True
+            reason = "no_external_url"
+        elif "indeed.com" in url_direct_str.lower():
+            # Redirection interne Indeed → Easy Apply
+            is_direct = True
+            reason = f"indeed_redirect:{url_direct_str[:60]}"
+        else:
+            # URL employeur externe → pas Easy Apply
+            is_direct = False
+            reason = f"external:{url_direct_str[:60]}"
+
+        if is_direct:
+            easy_count += 1
+        print(f"[indeed-easyapply] jk={_extract_indeed_jk(url_job) or '?'} → is_direct={is_direct} ({reason})")
 
         # Normalise le type JobSpy → nos catégories
         # IMPORTANT : on check alternance EN PREMIER car JobSpy retourne "internship"
@@ -390,7 +419,7 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         else:
             norm_type = "emploi"
 
-        raw_jobs.append({
+        jobs.append({
             "id":          make_id("indeed", url_job),
             "source_url":  "indeed",
             "title":       title,
@@ -400,49 +429,10 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
             "description": desc,
             "date":        date,
             "type":        norm_type,
-            "is_direct":   False,  # sera rempli en parallèle ci-dessous
+            "is_direct":   is_direct,
         })
 
-    if not raw_jobs:
-        return []
-
-    # ── Étape 2 : détection Easy Apply en parallèle ───────────────────────────
-    # On lance _check_indeed_easy_apply_manually pour chaque offre en parallèle
-    # dans un ThreadPoolExecutor dédié (max 8 workers).
-    # Timeout individuel : 8s par offre pour ne pas bloquer le cycle.
-    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
-
-    def _safe_check(url_job: str) -> bool:
-        try:
-            return _check_indeed_easy_apply_manually(url_job)
-        except Exception as e:
-            print(f"[indeed-easyapply] ⚠️  {url_job[:60]}: {e}")
-            return False
-
-    urls_to_check = [j["url"] for j in raw_jobs if j["url"]]
-    easy_apply_map: dict[str, bool] = {}
-
-    # max_workers=8 : on parallélise sans dépasser la limite du pool global
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        future_to_url = {pool.submit(_safe_check, u): u for u in urls_to_check}
-        for future in as_completed(future_to_url, timeout=60):
-            url_done = future_to_url[future]
-            try:
-                easy_apply_map[url_done] = future.result(timeout=10)
-            except FuturesTimeout:
-                print(f"[indeed-easyapply] ⏱️  Timeout sur {url_done[:60]}")
-                easy_apply_map[url_done] = False
-            except Exception as e:
-                print(f"[indeed-easyapply] ❌ {url_done[:60]}: {e}")
-                easy_apply_map[url_done] = False
-
-    # ── Étape 3 : injecter is_direct dans chaque job ─────────────────────────
-    jobs = []
-    for job in raw_jobs:
-        job["is_direct"] = easy_apply_map.get(job["url"], False)
-        jobs.append(job)
-
-    print(f"[indeed-easyapply] ✅ {sum(j['is_direct'] for j in jobs)}/{len(jobs)} offres Easy Apply détectées")
+    print(f"[indeed-easyapply] ✅ {easy_count}/{len(jobs)} offres Easy Apply détectées (via job_url_direct)")
     return jobs
 
 
