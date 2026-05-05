@@ -903,6 +903,177 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
     return jobs[:limit]
 
 
+
+# ── Stratégie Welcome to the Jungle : API Algolia (clés publiques) ────────────
+# WTTJ utilise Algolia en interne pour son moteur de recherche.
+# Les clés sont publiques et embarquées dans leur frontend JS — pas d'auth requise.
+# Index FR : wttj_jobs_production_fr
+# Endpoint  : POST https://{APP_ID}-dsn.algolia.net/1/indexes/{INDEX}/query
+
+WTTJ_ALGOLIA_APP_ID  = "0H5KBVPEX4"
+WTTJ_ALGOLIA_API_KEY = "552fdce494ae02d39a2671ea03af1bd2"
+WTTJ_INDEX_FR        = "wttj_jobs_production_fr"
+
+# Mapping contrats WTTJ → nos catégories
+_WTTJ_CONTRACT_MAP = {
+    "FULL_TIME":        "emploi",
+    "PART_TIME":        "emploi",
+    "TEMPORARY":        "emploi",
+    "FREELANCE":        "emploi",
+    "INTERNSHIP":       "stage",
+    "APPRENTICESHIP":   "alternance",
+    "VIE":              "emploi",
+}
+
+def _extract_wttj_params(url: str) -> dict:
+    """Extrait keywords, lieu et type de contrat depuis une URL WTTJ."""
+    parsed   = urlparse(url)
+    params   = parse_qs(parsed.query)
+    path_low = parsed.path.lower()
+    url_low  = url.lower()
+
+    # Mots-clés : paramètre 'query' dans l'URL WTTJ
+    keywords = params.get("query", params.get("q", [""]))[0]
+    # Fallback depuis le path : /fr/jobs/category/subcategory
+    if not keywords:
+        parts = [p for p in parsed.path.split("/") if p and p not in ("fr", "en", "jobs", "search")]
+        if parts:
+            keywords = parts[-1].replace("-", " ").strip()
+    if not keywords:
+        keywords = "développeur"
+
+    # Localisation
+    location = params.get("aroundLatLngViaIP", [""])[0] or params.get("location", ["France"])[0]
+
+    # Contrat : paramètre refinementList[contract_type][]
+    contracts = params.get("refinementList[contract_type][]", [])
+    contract = contracts[0] if contracts else ""
+
+    # Détecter alternance/stage dans le path/URL
+    if not contract:
+        if "alternance" in url_low or "apprenticeship" in url_low:
+            contract = "APPRENTICESHIP"
+        elif "stage" in url_low or "internship" in url_low:
+            contract = "INTERNSHIP"
+
+    return {"keywords": keywords, "location": location, "contract": contract}
+
+
+async def scrape_wttj(search_url: str, limit: int = 20) -> list[dict]:
+    """
+    Scrape Welcome to the Jungle via leur API Algolia interne.
+    Clés publiques embarquées dans le frontend WTTJ — pas d'auth requise.
+    """
+    wttj_p   = _extract_wttj_params(search_url)
+    keywords = wttj_p["keywords"]
+    contract = wttj_p["contract"]
+
+    # Construire les facetFilters
+    facet_filters: list = []
+    if contract:
+        facet_filters.append([f"contract_type:{contract}"])
+
+    algolia_body = {
+        "query":       keywords,
+        "hitsPerPage": min(limit * 2, 50),
+        "page":        0,
+        "attributesToRetrieve": [
+            "id", "name", "slug", "organization", "contract_type",
+            "published_at", "updated_at", "department", "office",
+            "profile", "salary",
+        ],
+    }
+    if facet_filters:
+        algolia_body["facetFilters"] = facet_filters
+
+    print(f"[wttj] 🔍 Algolia query — keywords='{keywords}' contract='{contract}'")
+
+    jobs: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"https://{WTTJ_ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/{WTTJ_INDEX_FR}/query",
+                headers={
+                    "X-Algolia-Application-Id": WTTJ_ALGOLIA_APP_ID,
+                    "X-Algolia-API-Key":        WTTJ_ALGOLIA_API_KEY,
+                    "Content-Type":             "application/json",
+                },
+                json=algolia_body,
+            )
+            print(f"[wttj] 📡 HTTP {r.status_code}")
+            if r.status_code != 200:
+                raise Exception(f"Algolia HTTP {r.status_code}: {r.text[:200]}")
+
+            data = r.json()
+            hits = data.get("hits", [])
+            print(f"[wttj] {len(hits)} hits Algolia pour '{keywords}'")
+
+            for hit in hits:
+                if len(jobs) >= limit:
+                    break
+
+                title   = hit.get("name", "").strip()
+                if not title:
+                    continue
+
+                # Organisation
+                org     = hit.get("organization") or {}
+                company = org.get("name", "").strip()
+                org_slug = org.get("slug", "")
+
+                # Slug offre
+                job_slug = hit.get("slug", hit.get("id", ""))
+
+                # URL de l'offre
+                if job_slug and org_slug:
+                    url_job = f"https://www.welcometothejungle.com/fr/companies/{org_slug}/jobs/{job_slug}"
+                else:
+                    url_job = search_url
+
+                # Localisation : office (peut être une liste)
+                offices = hit.get("office") or []
+                if isinstance(offices, list) and offices:
+                    loc = offices[0].get("city", "") or offices[0].get("country", "France")
+                elif isinstance(offices, dict):
+                    loc = offices.get("city", "") or offices.get("country", "France")
+                else:
+                    loc = "France"
+
+                # Date
+                date = safe_date(hit.get("published_at") or hit.get("updated_at"))
+
+                # Type de contrat
+                raw_contract = hit.get("contract_type", "")
+                if isinstance(raw_contract, list):
+                    raw_contract = raw_contract[0] if raw_contract else ""
+                jtype = _WTTJ_CONTRACT_MAP.get(str(raw_contract).upper(), "emploi")
+                # Override si contrat forcé ou si guess du titre confirme
+                if not contract:
+                    jtype = guess_type(title, "")
+
+                # Description depuis profile (résumé des missions)
+                profile = hit.get("profile", "") or ""
+                desc    = strip_html(str(profile))[:400]
+
+                jobs.append({
+                    "id":          make_id("wttj", url_job),
+                    "source_url":  search_url,
+                    "title":       title,
+                    "company":     company,
+                    "location":    loc,
+                    "url":         url_job,
+                    "description": desc,
+                    "date":        date,
+                    "type":        jtype,
+                })
+
+    except Exception as e:
+        print(f"[wttj] ❌ error: {e}")
+
+    print(f"[wttj] ✅ {len(jobs)} offres retournées")
+    return jobs[:limit]
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 async def scrape_url(url: str, limit: int = 20) -> dict:
@@ -936,6 +1107,12 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
         if c == "alternance": filter_cat = "alternance"
         elif c == "stage":    filter_cat = "stage"
         else:                 filter_cat = None
+    elif platform == "wtj":
+        wttj_p = _extract_wttj_params(url)
+        c = wttj_p.get("contract", "")
+        if c == "APPRENTICESHIP":  filter_cat = "alternance"
+        elif c == "INTERNSHIP":    filter_cat = "stage"
+        else:                      filter_cat = None
     elif platform == "francetravail":
         ft_p = _extract_ft_params(url)
         c = ft_p.get("contract", "")
@@ -1002,6 +1179,14 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
             except Exception as e_az:
                 jobs = await scrape_generic_fetch(url, platform, limit * 2)
                 strategy_used = f"generic_fallback (adzuna failed: {e_az})"
+
+        elif platform == "wtj":
+            try:
+                jobs = await scrape_wttj(url, limit)
+                strategy_used = "wttj_algolia"
+            except Exception as e_wttj:
+                jobs = await scrape_generic_fetch(url, platform, limit * 2)
+                strategy_used = f"generic_fallback (wttj failed: {e_wttj})"
 
         elif platform == "francetravail":
             try:
