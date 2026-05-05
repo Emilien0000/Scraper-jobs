@@ -344,7 +344,7 @@ async def scrape_indeed_jobspy(keywords: str, location: str, limit: int, job_typ
 
 # ── Stratégie LinkedIn : JobSpy → LinkedIn ───────────────────────────────────
 
-def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job_type: str | None) -> list[dict]:
+def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job_type: str | None, easy_apply: bool = False) -> list[dict]:
     """Exécution synchrone de JobSpy pour LinkedIn — à appeler via run_in_executor."""
     from jobspy import scrape_jobs
 
@@ -359,6 +359,9 @@ def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job
     )
     if job_type:
         kwargs["job_type"] = job_type
+    # easy_apply=True injecte f_AL=true dans la requête LinkedIn → filtre côté LinkedIn
+    if easy_apply:
+        kwargs["easy_apply"] = True
 
     df = scrape_jobs(**kwargs)
     if df is None or df.empty:
@@ -380,9 +383,9 @@ def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job
         raw_direct = row.get("is_direct_apply")
         is_direct = bool(raw_direct) and str(raw_direct).lower() not in ('nan', 'none', 'false', '0')
 
-        # Fallback manuel si JobSpy n'a pas détecté l'Easy Apply
-        if not is_direct and url_job:
-            is_direct = _check_linkedin_easy_apply(url_job)
+        # Si on a demandé easy_apply=True à JobSpy, tous les résultats sont Easy Apply par définition
+        if easy_apply:
+            is_direct = True
 
         guessed = guess_type(title, desc)
         if guessed == "alternance":
@@ -409,13 +412,13 @@ def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job
     return jobs
 
 
-async def scrape_linkedin_jobspy(keywords: str, location: str, limit: int, job_type: str | None = None) -> list[dict]:
+async def scrape_linkedin_jobspy(keywords: str, location: str, limit: int, job_type: str | None = None, easy_apply: bool = False) -> list[dict]:
     """Wrapper async autour de JobSpy LinkedIn."""
     loop = asyncio.get_event_loop()
     jobs = await loop.run_in_executor(
         _executor,
         _jobspy_linkedin_sync,
-        keywords, location, limit, job_type,
+        keywords, location, limit, job_type, easy_apply,
     )
     return jobs[:limit]
 
@@ -1138,14 +1141,21 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
             linkedin_type_map = {"I": "internship", "F": "fulltime", "P": "parttime", "C": "contract", "T": "contract"}
             jobspy_type = linkedin_type_map.get(jt_param, None)
 
+            # Détection Easy Apply : LinkedIn utilise f_LF=f_AL dans l'URL
+            # JobSpy expose easy_apply=True qui injecte f_AL=true dans la requête
+            lf_params = params.get("f_LF", [])
+            easy_apply_requested = "f_AL" in lf_params or "f_AL" in url
+
             # Enrichir les keywords si alternance dans l'URL
             search_keywords = keywords
             if "alternance" in url.lower() and "alternance" not in search_keywords.lower():
                 search_keywords += " alternance"
 
             try:
-                jobs = await scrape_linkedin_jobspy(search_keywords, location, limit * 3, jobspy_type)
+                jobs = await scrape_linkedin_jobspy(search_keywords, location, limit * 3, jobspy_type, easy_apply=easy_apply_requested)
                 strategy_used = "jobspy_linkedin"
+                if easy_apply_requested:
+                    print(f"[linkedin] ✅ Easy Apply activé (f_AL détecté dans l'URL)")
             except Exception as e1:
                 jobs = await scrape_generic_fetch(url, platform, limit * 2)
                 strategy_used = f"generic_fallback (linkedin jobspy failed: {e1})"
