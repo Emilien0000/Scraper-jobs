@@ -1,11 +1,5 @@
-# scraper-service/main.py  v3.1 — PATCH : upsert cumulatif (plus de DELETE global)
+# scraper-service/main.py  v3.0
 # ─────────────────────────────────────────────────────────────────────────────
-# CORRECTIF PRINCIPAL :
-#   - Suppression du DELETE global avant chaque INSERT
-#   - Les offres s'accumulent dans jb_jobs (upsert sur user_id+url)
-#   - Nettoyage doux : seules les offres > 30 jours sont supprimées
-#   - Tri par date côté scraper avant upsert (les plus récentes en premier)
-#
 # Stratégie principale : JobSpy (python-jobspy) → Indeed France
 #   - tls-client en interne → bypass bot-detection sans proxy
 #   - Fallback : scrape_generic_fetch (JSON-LD) pour les autres plateformes
@@ -14,12 +8,12 @@
 #   pip install fastapi uvicorn httpx feedparser python-dateutil python-jobspy
 #
 # Variable d'environnement :
-#   SCRAPER_SECRET=ton_secret_partage
+#   SCRAPER_SECRET=ton_secret_partagefsss
 # ─────────────────────────────────────────────────────────────────────────────
 import tls_client
 import os, re, json, random, asyncio
 import httpx
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse, urlencode, urljoin, parse_qs
 from concurrent.futures import ThreadPoolExecutor
@@ -32,9 +26,8 @@ from dateutil import parser as dateparser
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_role key (bypass RLS)
 AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "300"))  # 5 min par défaut
-JOB_RETENTION_DAYS   = int(os.environ.get("JOB_RETENTION_DAYS", "30"))     # supprime les offres > 30j
 
-app = FastAPI(title="JobScraper JobSpy v3.1-patch", version="3.1.1")
+app = FastAPI(title="JobScraper JobSpy v3.1", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -187,6 +180,9 @@ def strip_html(text: str) -> str:
 
 
 # ── Stratégie 1 : JobSpy → Indeed France ─────────────────────────────────────
+# JobSpy utilise tls-client (fingerprint TLS de vrai navigateur) → bypass
+# la détection bot d'Indeed même depuis une IP datacenter (Render, Railway…).
+# Il tourne en synchrone → on l'exécute dans un ThreadPoolExecutor.
 
 def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_type: str | None) -> list[dict]:
     """Exécution synchrone de JobSpy — à appeler via run_in_executor."""
@@ -198,7 +194,7 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         location        = location or "France",
         results_wanted  = results_wanted,
         country_indeed  = "france",      # indeed.fr
-        hours_old       = 240,           # offres des 10 derniers jours
+        hours_old       = 240,           # offres des 10 derniers jours (72h trop restrictif)
         description_format = "markdown",
         verbose         = 0,
     )
@@ -221,12 +217,16 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
 
+        # Normalise le type JobSpy → nos catégories
+        # IMPORTANT : on check alternance EN PREMIER car JobSpy retourne "internship"
+        # pour TOUT (stages ET alternances) — le texte est le seul signal fiable.
         guessed = guess_type(title, desc)
         if guessed == "alternance":
             norm_type = "alternance"
         elif guessed == "stage":
             norm_type = "stage"
         elif "intern" in jtype.lower():
+            # JobSpy dit internship mais le texte ne tranché pas → stage par défaut
             norm_type = "stage"
         else:
             norm_type = "emploi"
@@ -327,19 +327,22 @@ async def scrape_linkedin_jobspy(keywords: str, location: str, limit: int, job_t
 
 
 # ── Stratégie 2 : fetch HTML + JSON-LD (fallback générique) ──────────────────
+# Fonctionne pour HelloWork, Adzuna, WTJ, stage.fr, etc.
 
 async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) -> list[dict]:
+    # Remplacement de httpx par tls_client pour bypasser Cloudflare/Indeed comme le fait JobSpy
     session = tls_client.Session(
         client_identifier="chrome_124",
         random_tls_extension_order=True
     )
-
+    
+    # tls_client est synchrone, on l'exécute dans l'executor pour ne pas bloquer FastAPI
     loop = asyncio.get_event_loop()
     r = await loop.run_in_executor(
-        None,
+        None, 
         lambda: session.get(search_url, headers=browser_headers())
     )
-
+    
     html = r.text
     jobs = []
 
@@ -415,7 +418,8 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     error         = None
     strategy_used = "unknown"
 
-    # 1. Extraire la catégorie selon la plateforme
+    # 1. On extrait la catégorie d'entrée de jeu, pour TOUTES les stratégies
+    # Extraire la catégorie selon la plateforme
     if platform == "indeed":
         _, filter_cat = extract_indeed_jobtype(url)
     elif platform == "linkedin":
@@ -431,24 +435,34 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
     try:
         if platform == "indeed":
             search_keywords = keywords
+            # Forcer le mot pour aider JobSpy
             if filter_cat == "alternance" and "alternance" not in search_keywords.lower():
                 search_keywords += " alternance"
-
+            
             try:
+                # 2. On demande à JobSpy de ratisser TRES large (ex: 20 * 8 = 160 offres) 
+                # pour compenser le fait qu'il n'utilise pas le paramètre d'URL exact.
                 fetch_limit = limit * 8 if filter_cat else limit
+                # FIX : passer job_type à JobSpy pour qu'il filtre aussi côté Indeed
                 jobspy_type = "internship" if filter_cat in ("alternance", "stage") else None
                 jobs = await scrape_indeed_jobspy(search_keywords, location, fetch_limit, jobspy_type)
                 strategy_used = "jobspy_indeed"
+                
+                # On ne lève plus d'erreur ici si c'est vide, on laisse couler vers le filtre final
             except Exception as e1:
+                # Si JobSpy plante sec, le fallback va utiliser la VRAIE URL avec le paramètre sc=... 
+                # et le nouveau tls_client passera les sécurités !
                 jobs = await scrape_generic_fetch(url, platform, limit * 4)
                 strategy_used = f"generic_fallback (jobspy failed: {e1})"
-
         elif platform == "linkedin":
+            # Détection du job type depuis les paramètres de l'URL LinkedIn
+            # ex: ?f_JT=I (internship), ?f_JT=F (fulltime), ?keywords=...
             params = parse_qs(urlparse(url).query)
             jt_param = params.get("f_JT", [""])[0].upper()
             linkedin_type_map = {"I": "internship", "F": "fulltime", "P": "parttime", "C": "contract", "T": "contract"}
             jobspy_type = linkedin_type_map.get(jt_param, None)
 
+            # Enrichir les keywords si alternance dans l'URL
             search_keywords = keywords
             if "alternance" in url.lower() and "alternance" not in search_keywords.lower():
                 search_keywords += " alternance"
@@ -461,20 +475,18 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
                 strategy_used = f"generic_fallback (linkedin jobspy failed: {e1})"
 
         else:
+            # Toutes les autres plateformes
             jobs = await scrape_generic_fetch(url, platform, limit * 2)
             strategy_used = "generic_fetch"
 
     except Exception as e:
         error = str(e)
 
-    # 2. Post-filtrage par catégorie
+    # 3. LE BLINDAGE FINAL : On post-filtre systématiquement ici, peu importe la stratégie !
     if filter_cat:
         jobs = filter_by_category(jobs, filter_cat)
 
-    # ✅ CORRECTIF : Trier par date décroissante avant de retourner
-    # Les offres les plus récentes arrivent en tête du feed
-    jobs.sort(key=lambda j: j.get("date", ""), reverse=True)
-
+    # On s'assure de ne renvoyer que la limite demandée (20)
     final_jobs = jobs[:limit]
 
     return {
@@ -500,7 +512,7 @@ class ScrapeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "job-scraper", "version": "3.1.1", "strategy": "jobspy_indeed+linkedin+jsonld+cumulative_upsert"}
+    return {"status": "ok", "service": "job-scraper", "version": "3.1.0", "strategy": "jobspy_indeed+linkedin+jsonld"}
 
 
 @app.post("/scrape")
@@ -516,8 +528,7 @@ async def scrape_post(
     results = list(await asyncio.gather(*[scrape_url(u, body.results_wanted) for u in body.urls]))
     errors  = [{"url": r["url"], "error": r["error"]} for r in results if r["error"]]
 
-    # ✅ CORRECTIF : On ne purge PLUS les anciens jobs avant d'insérer.
-    # On fait un upsert cumulatif (user_id+url = clé unique → merge si existe déjà).
+    # Si un user_id est fourni, on upsert directement dans Supabase avec user_id
     if body.user_id and SUPABASE_URL and SUPABASE_KEY:
         jobs_to_insert = []
         seen = set()
@@ -527,7 +538,7 @@ async def scrape_post(
                     seen.add(job["url"])
                     jobs_to_insert.append({
                         "user_id":     body.user_id,
-                        "source_url":  result.get("url", ""),
+                        "source_url":  result.get("url", ""), 
                         "title":       job.get("title", "(sans titre)"),
                         "company":     job.get("company", ""),
                         "location":    job.get("location", ""),
@@ -538,14 +549,12 @@ async def scrape_post(
                     })
         if jobs_to_insert:
             try:
-                # ✅ Nettoyage doux : supprime uniquement les offres > JOB_RETENTION_DAYS
-                await _supabase_delete_old("jb_jobs", body.user_id, days=JOB_RETENTION_DAYS)
-                print(f"[scrape] 🧹 Offres > {JOB_RETENTION_DAYS}j nettoyées pour user {body.user_id[:8]}…")
-
-                # ✅ Upsert cumulatif : les nouvelles offres s'ajoutent, les existantes sont mises à jour
+                # Purge les anciens jobs de cet user avant d'insérer les nouveaux
+                await _supabase_delete("jb_jobs", body.user_id)
+                print(f"[scrape] 🗑️  Anciens jobs purgés pour user {body.user_id[:8]}…")
                 for i in range(0, len(jobs_to_insert), 50):
                     await _supabase_upsert("jb_jobs", jobs_to_insert[i:i+50], on_conflict="user_id,url")
-                print(f"[scrape] 💾 {len(jobs_to_insert)} offres upsertées pour user {body.user_id[:8]}…")
+                print(f"[scrape] 💾 {len(jobs_to_insert)} offres insérées pour user {body.user_id[:8]}…")
             except Exception as e:
                 print(f"[scrape] ❌ Upsert erreur: {e}")
 
@@ -569,7 +578,12 @@ async def scrape_get(
     return {"ok": True, "results": [result], "errors": [], "total": result["count"]}
 
 
-# ── Helpers Supabase ──────────────────────────────────────────────────────────
+# ── Auto-scraper background ───────────────────────────────────────────────────
+# Toutes les AUTO_SCRAPE_INTERVAL secondes (défaut 300 = 5 min) :
+#   1. Lit la table user_filters dans Supabase pour récupérer tous les liens actifs
+#   2. Scrappe chaque URL unique (dédupliquée entre users)
+#   3. Upsert les offres dans jb_jobs
+#   4. Met à jour lastScraped + jobCount dans user_filters pour chaque user
 
 async def _supabase_get(path: str) -> list[dict]:
     """Lecture REST Supabase (service role)."""
@@ -605,15 +619,10 @@ async def _supabase_upsert(table: str, rows: list[dict], on_conflict: str = "id"
         )
         r.raise_for_status()
 
-# ✅ NOUVELLE FONCTION : supprime uniquement les offres plus vieilles que N jours
-async def _supabase_delete_old(table: str, user_id: str, days: int = 30) -> None:
-    """
-    Supprime les offres d'un user dont la date est antérieure à `days` jours.
-    Remplace l'ancien _supabase_delete qui vidait TOUT le feed à chaque cycle.
-    """
+async def _supabase_delete(table: str, user_id: str) -> None:
+    """Supprime tous les jobs d un user (DELETE REST Supabase, service role)."""
     if not SUPABASE_URL or not SUPABASE_KEY or not user_id:
         return
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.delete(
             f"{SUPABASE_URL}/rest/v1/{table}",
@@ -622,10 +631,7 @@ async def _supabase_delete_old(table: str, user_id: str, days: int = 30) -> None
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Prefer":        "return=minimal",
             },
-            params={
-                "user_id": f"eq.{user_id}",
-                "date":    f"lt.{cutoff}",  # seulement les offres antérieures au cutoff
-            },
+            params={"user_id": f"eq.{user_id}"},
         )
         r.raise_for_status()
 
@@ -655,18 +661,24 @@ def _normalize_date(val) -> str:
     except Exception:
         return datetime.now(timezone.utc).isoformat()
 
-
-# ── Auto-scraper background ───────────────────────────────────────────────────
-# Toutes les AUTO_SCRAPE_INTERVAL secondes (défaut 300 = 5 min) :
-#   1. Lit la table user_filters dans Supabase pour récupérer tous les liens actifs
-#   2. Scrappe chaque URL unique (dédupliquée entre users)
-#   3. Upsert CUMULATIF les offres dans jb_jobs (plus de DELETE global)
-#   4. Nettoie les offres > JOB_RETENTION_DAYS jours (doux)
-#   5. Met à jour lastScraped + jobCount dans user_filters pour chaque user
-
 async def auto_scrape_cycle() -> None:
     """Un cycle complet d'auto-scrape pour tous les users."""
-    print(f"[auto-scrape] Début cycle — {datetime.now(timezone.utc).isoformat()}")
+    now = datetime.now(timezone.utc)
+    print(f"[auto-scrape] Début cycle — {now.isoformat()}")
+
+    # Purge des jobs trop anciens (> 7 jours) pour garder la table propre
+    if SUPABASE_URL and SUPABASE_KEY:
+        cutoff = (now.replace(hour=0, minute=0, second=0) - __import__("datetime").timedelta(days=7)).isoformat()
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.delete(
+                    f"{SUPABASE_URL}/rest/v1/jb_jobs",
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "return=minimal"},
+                    params={"date": f"lt.{cutoff}"},
+                )
+                print(f"[auto-scrape] 🧹 Purge jobs > 7j : status {r.status_code}")
+        except Exception as e:
+            print(f"[auto-scrape] ⚠️  Purge échouée : {e}")
     try:
         # 1. Lire tous les user_filters
         rows = await _supabase_get("user_filters?select=id,filters")
@@ -707,7 +719,7 @@ async def auto_scrape_cycle() -> None:
 
     await asyncio.gather(*[scrape_one(u) for u in url_to_users])
 
-    # 4. Upsert CUMULATIF des jobs dans jb_jobs — UN PAR USER pour respecter l'isolation
+    # 4. Upsert les jobs dans jb_jobs — UN PAR USER pour respecter l isolation
     total_inserted = 0
     for row in rows:
         user_id = row["id"]
@@ -718,13 +730,6 @@ async def auto_scrape_cycle() -> None:
         user_urls = {f["url"] for f in filters if isinstance(f, dict) and f.get("enabled") and f.get("url")}
         if not user_urls:
             continue
-
-        # ✅ Nettoyage doux : supprimer uniquement les offres très vieilles
-        try:
-            await _supabase_delete_old("jb_jobs", user_id, days=JOB_RETENTION_DAYS)
-            print(f"[auto-scrape] 🧹 Offres > {JOB_RETENTION_DAYS}j supprimées pour user {user_id[:8]}…")
-        except Exception as e:
-            print(f"[auto-scrape] ⚠️ Nettoyage échoué pour user {user_id[:8]}: {e}")
 
         user_jobs = []
         seen_for_user = set()
@@ -745,14 +750,13 @@ async def auto_scrape_cycle() -> None:
                         "description": job.get("description", ""),
                         "date":        _normalize_date(job.get("date")),
                         "type":        job.get("type", "emploi"),
+                        "scraped_at":  datetime.now(timezone.utc).isoformat(),
                     })
 
         if user_jobs:
             try:
                 batch_size = 50
                 for i in range(0, len(user_jobs), batch_size):
-                    # ✅ Upsert cumulatif : les nouvelles offres s'ajoutent,
-                    # les existantes (même user_id+url) sont mises à jour (titre, desc, etc.)
                     await _supabase_upsert("jb_jobs", user_jobs[i:i+batch_size], on_conflict="user_id,url")
                 total_inserted += len(user_jobs)
                 print(f"[auto-scrape] 💾 {len(user_jobs)} offres upsertées pour user {user_id[:8]}…")
@@ -802,7 +806,6 @@ async def startup_event():
     if SUPABASE_URL and SUPABASE_KEY:
         asyncio.create_task(auto_scrape_loop())
         print(f"[auto-scrape] 🚀 Scheduler démarré — cycle toutes les {AUTO_SCRAPE_INTERVAL}s")
-        print(f"[auto-scrape] 🗑️  Rétention des offres : {JOB_RETENTION_DAYS} jours")
     else:
         print("[auto-scrape] ⚠️  SUPABASE_URL / SUPABASE_SERVICE_KEY non définis — scheduler désactivé")
 
