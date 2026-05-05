@@ -408,6 +408,137 @@ async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) 
     return jobs[:limit]
 
 
+
+# ── Stratégie HelloWork : API JSON interne ───────────────────────────────────
+# HelloWork expose une API REST non documentée utilisée par son propre frontend.
+# On parse les paramètres de l'URL de recherche pour reconstruire l'appel API.
+
+def _extract_hellowork_params(url: str) -> dict:
+    """Extrait keywords, lieu, contrat depuis une URL HelloWork de recherche."""
+    parsed = urlparse(url)
+    # Format : /fr/emplois/recherche?q=...&l=...&c=alternance
+    params = parse_qs(parsed.query)
+    # Format alternatif : /fr/emplois/alternance/developpeur-h-f-a-paris (slug)
+    path_parts = [p for p in parsed.path.split("/") if p]
+
+    keywords = params.get("q", [""])[0]
+    location = params.get("l", ["France"])[0] or "France"
+    contract = params.get("c", [""])[0].lower()  # alternance, stage, cdi, cdd...
+
+    # Fallback : lire le slug
+    if not keywords and len(path_parts) >= 3:
+        slug = path_parts[-1] if path_parts[-1] not in ("recherche", "emplois") else path_parts[-2]
+        keywords = slug.replace("-h-f", "").replace("-f-h", "").replace("-", " ").strip()
+    if not keywords:
+        keywords = "développeur"
+
+    # Détecter le type de contrat dans le path si pas dans les params
+    path_lower = parsed.path.lower()
+    if not contract:
+        if "alternance" in path_lower: contract = "alternance"
+        elif "stage"     in path_lower: contract = "stage"
+
+    return {"keywords": keywords, "location": location, "contract": contract}
+
+
+async def scrape_hellowork(search_url: str, limit: int = 20) -> list[dict]:
+    """
+    Scrape HelloWork via leur API JSON interne.
+    Endpoint : https://www.hellowork.com/fr-fr/api/jobs/search
+    """
+    hw_params = _extract_hellowork_params(search_url)
+    keywords  = hw_params["keywords"]
+    location  = hw_params["location"]
+    contract  = hw_params["contract"]
+
+    # Mapping contrat HelloWork → notre catégorie
+    contract_map = {
+        "alternance":   "ALTERNANCE",
+        "apprentissage":"APPRENTISSAGE",
+        "stage":        "INTERNSHIP",
+        "cdi":          "CDI",
+        "cdd":          "CDD",
+        "freelance":    "FREELANCE",
+    }
+    hw_contract = contract_map.get(contract, "")
+
+    api_params: dict = {
+        "k":       keywords,
+        "l":       location,
+        "nb":      min(limit * 2, 50),  # HelloWork retourne max 50 par page
+        "page":    1,
+        "sorting": "date",              # tri par date de publication
+    }
+    if hw_contract:
+        api_params["c"] = hw_contract
+
+    headers = {
+        "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Accept":      "application/json, text/plain, */*",
+        "Accept-Language": "fr-FR,fr;q=0.9",
+        "Referer":     "https://www.hellowork.com/",
+        "Origin":      "https://www.hellowork.com",
+    }
+
+    jobs: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(
+                "https://www.hellowork.com/fr-fr/api/jobs/search",
+                params=api_params,
+                headers=headers,
+            )
+            if r.status_code != 200:
+                raise Exception(f"HelloWork API status {r.status_code}")
+
+            data = r.json()
+            # Structure réelle: data["jobs"] ou data["results"] ou data["data"]
+            raw_jobs = (
+                data.get("jobs") or
+                data.get("results") or
+                data.get("data", {}).get("jobs") or
+                []
+            )
+
+            for item in raw_jobs:
+                title   = item.get("title") or item.get("name") or ""
+                company = item.get("company", {}).get("name") if isinstance(item.get("company"), dict) else item.get("company") or item.get("companyName") or ""
+                loc     = item.get("location") or item.get("city") or item.get("place") or ""
+                url_job = item.get("url") or item.get("link") or item.get("applyUrl") or ""
+                if not url_job.startswith("http"):
+                    url_job = f"https://www.hellowork.com{url_job}"
+                desc    = strip_html(item.get("description") or item.get("excerpt") or "")[:400]
+                date    = safe_date(item.get("publishedAt") or item.get("date") or item.get("createdAt"))
+                jtype   = guess_type(title, desc)
+                # Forcer le type si on a un filtre contrat explicite
+                if contract == "alternance": jtype = "alternance"
+                elif contract == "stage":    jtype = "stage"
+
+                if not title or not url_job:
+                    continue
+
+                jobs.append({
+                    "id":          make_id("hellowork", url_job),
+                    "source_url":  search_url,
+                    "title":       title,
+                    "company":     str(company),
+                    "location":    str(loc),
+                    "url":         url_job,
+                    "description": desc,
+                    "date":        date,
+                    "type":        jtype,
+                })
+                if len(jobs) >= limit:
+                    break
+
+    except Exception as e:
+        print(f"[hellowork] API error: {e} — tentative JSON-LD fallback")
+        # Fallback : scrape_generic_fetch (JSON-LD) si l'API échoue
+        jobs = await scrape_generic_fetch(search_url, "hellowork", limit)
+
+    return jobs[:limit]
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 async def scrape_url(url: str, limit: int = 20) -> dict:
@@ -429,6 +560,12 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
             filter_cat = "stage"
         else:
             filter_cat = None
+    elif platform == "hellowork":
+        hw_p = _extract_hellowork_params(url)
+        c = hw_p.get("contract", "")
+        if c in ("alternance", "apprentissage"): filter_cat = "alternance"
+        elif c == "stage":                        filter_cat = "stage"
+        else:                                     filter_cat = None
     else:
         filter_cat = None
 
@@ -474,6 +611,14 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
                 jobs = await scrape_generic_fetch(url, platform, limit * 2)
                 strategy_used = f"generic_fallback (linkedin jobspy failed: {e1})"
 
+        elif platform == "hellowork":
+            try:
+                jobs = await scrape_hellowork(url, limit)
+                strategy_used = "hellowork_api"
+            except Exception as e_hw:
+                jobs = await scrape_generic_fetch(url, platform, limit * 2)
+                strategy_used = f"generic_fallback (hellowork failed: {e_hw})"
+
         else:
             # Toutes les autres plateformes
             jobs = await scrape_generic_fetch(url, platform, limit * 2)
@@ -512,7 +657,7 @@ class ScrapeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "job-scraper", "version": "3.1.0", "strategy": "jobspy_indeed+linkedin+jsonld"}
+    return {"status": "ok", "service": "job-scraper", "version": "3.1.0", "strategy": "jobspy_indeed+linkedin+hellowork+jsonld"}
 
 
 @app.post("/scrape")
