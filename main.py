@@ -823,6 +823,13 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
     kw_tokens  = [t for t in kw_tokens if t not in STOP_WORDS]
     kw_pattern = re.compile("|".join(re.escape(t) for t in kw_tokens), re.IGNORECASE) if kw_tokens else None
 
+    # Normaliser les keywords (accents NFC, strip espaces)
+    import unicodedata
+    keywords = unicodedata.normalize("NFC", keywords).strip()
+    api_params["motsCles"] = keywords
+
+    print(f"[francetravail] 🔍 Appel API — keywords='{keywords}' dept='{dept}' contract='{contract}' range='{api_params['range']}'")
+
     jobs: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -834,10 +841,12 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
                     "Accept":        "application/json",
                 },
             )
+            print(f"[francetravail] 📡 HTTP {r.status_code} — {r.text[:300]}")
             if r.status_code == 206 or r.status_code == 200:
                 data    = r.json()
                 results = data.get("resultats", [])
             elif r.status_code == 204:
+                print("[francetravail] ⚠️  HTTP 204 — aucun résultat (critères trop restrictifs ?)")
                 results = []
             else:
                 raise Exception(f"FT API status {r.status_code}: {r.text[:200]}")
