@@ -794,6 +794,14 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
                 jobs = await scrape_generic_fetch(url, platform, limit * 2)
                 strategy_used = f"generic_fallback (hellowork failed: {e_hw})"
 
+        elif platform == "adzuna":
+            try:
+                jobs = await scrape_adzuna(url, limit)
+                strategy_used = "adzuna_api"
+            except Exception as e_az:
+                jobs = await scrape_generic_fetch(url, platform, limit * 2)
+                strategy_used = f"generic_fallback (adzuna failed: {e_az})"
+
         else:
             # Toutes les autres plateformes
             jobs = await scrape_generic_fetch(url, platform, limit * 2)
