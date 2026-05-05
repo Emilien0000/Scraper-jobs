@@ -409,131 +409,196 @@ async def scrape_generic_fetch(search_url: str, platform: str, limit: int = 20) 
 
 
 
-# ── Stratégie HelloWork : API JSON interne ───────────────────────────────────
-# HelloWork expose une API REST non documentée utilisée par son propre frontend.
-# On parse les paramètres de l'URL de recherche pour reconstruire l'appel API.
+# ── Stratégie HelloWork : HTML scraping (BeautifulSoup) ─────────────────────
+# HelloWork utilise des composants Lit/Web Components avec des inputs cachés.
+# Sélecteur fiable : li[data-id-storage-item-id]
+# Technique inspirée de github.com/Zeffut/JobScraper
+
+import re as _re
+from datetime import timedelta as _timedelta
 
 def _extract_hellowork_params(url: str) -> dict:
     """Extrait keywords, lieu, contrat depuis une URL HelloWork de recherche."""
     parsed = urlparse(url)
-    # Format : /fr/emplois/recherche?q=...&l=...&c=alternance
     params = parse_qs(parsed.query)
-    # Format alternatif : /fr/emplois/alternance/developpeur-h-f-a-paris (slug)
     path_parts = [p for p in parsed.path.split("/") if p]
 
-    keywords = params.get("q", [""])[0]
+    # Paramètre k (HelloWork) ou q (fallback)
+    keywords = params.get("k", params.get("q", [""]))[0]
     location = params.get("l", ["France"])[0] or "France"
-    contract = params.get("c", [""])[0].lower()  # alternance, stage, cdi, cdd...
+    contract = params.get("c", [""])[0].lower()
 
-    # Fallback : lire le slug
-    if not keywords and len(path_parts) >= 3:
-        slug = path_parts[-1] if path_parts[-1] not in ("recherche", "emplois") else path_parts[-2]
-        keywords = slug.replace("-h-f", "").replace("-f-h", "").replace("-", " ").strip()
+    # Fallback slug
+    if not keywords and len(path_parts) >= 2:
+        slug = path_parts[-1] if path_parts[-1] not in ("recherche.html", "emploi") else ""
+        if slug:
+            keywords = slug.replace("-h-f", "").replace("-f-h", "").replace("-", " ").strip()
     if not keywords:
         keywords = "développeur"
 
-    # Détecter le type de contrat dans le path si pas dans les params
+    # Détecter contrat dans le path
     path_lower = parsed.path.lower()
     if not contract:
         if "alternance" in path_lower: contract = "alternance"
-        elif "stage"     in path_lower: contract = "stage"
+        elif "stage"    in path_lower: contract = "stage"
 
     return {"keywords": keywords, "location": location, "contract": contract}
 
 
+def _parse_hw_relative_date(text: str) -> str:
+    """Convertit une date relative FR HelloWork en ISO."""
+    now = datetime.now(timezone.utc)
+    text = text.lower().strip()
+    patterns = [
+        (_re.compile(r"il y a (\d+)\s*minute"), lambda m: now - _timedelta(minutes=int(m.group(1)))),
+        (_re.compile(r"il y a (\d+)\s*heure"),  lambda m: now - _timedelta(hours=int(m.group(1)))),
+        (_re.compile(r"il y a (\d+)\s*jour"),   lambda m: now - _timedelta(days=int(m.group(1)))),
+        (_re.compile(r"il y a (\d+)\s*semaine"),lambda m: now - _timedelta(weeks=int(m.group(1)))),
+        (_re.compile(r"il y a (\d+)\s*mois"),   lambda m: now - _timedelta(days=int(m.group(1)) * 30)),
+        (_re.compile(r"aujourd"),                lambda m: now),
+        (_re.compile(r"hier"),                   lambda m: now - _timedelta(days=1)),
+    ]
+    for pat, handler in patterns:
+        m = pat.search(text)
+        if m:
+            return handler(m).isoformat()
+    return now.isoformat()
+
+
+def _parse_hw_cards_sync(html: str, search_url: str, contract: str, limit: int) -> list[dict]:
+    """Parse les cartes HelloWork depuis le HTML brut."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "lxml")
+    jobs = []
+
+    # Sélecteur principal (structure 2024-2025 HelloWork)
+    cards = soup.select("li[data-id-storage-item-id]")
+    if not cards:
+        # Fallback : liens d'offres
+        seen_hrefs: set = set()
+        for link in soup.select("a[href*='/emplois/']"):
+            href = link.get("href", "")
+            if href in seen_hrefs: continue
+            seen_hrefs.add(href)
+            parent = link.find_parent("li")
+            if parent and parent not in cards:
+                cards.append(parent)
+
+    for card in cards:
+        if len(jobs) >= limit:
+            break
+        try:
+            job_id = card.get("data-id-storage-item-id", "")
+
+            # URL
+            link_el = card.select_one("a[href*='/emplois/']")
+            url_job = link_el.get("href", "") if link_el else f"/fr-fr/emplois/{job_id}.html"
+            if url_job.startswith("/"):
+                url_job = f"https://www.hellowork.com{url_job}"
+
+            # Titre (input caché le plus fiable)
+            title_input = card.select_one('input[name="title"]')
+            if title_input:
+                title = title_input.get("value", "").strip()
+            else:
+                el = card.select_one("p.tw-typo-l, h3, h2")
+                title = el.get_text(strip=True) if el else ""
+
+            # Société
+            company_input = card.select_one('input[name="company"]')
+            if company_input:
+                company = company_input.get("value", "").strip()
+            else:
+                el = card.select_one("p.tw-typo-s.tw-inline")
+                company = el.get_text(strip=True) if el else ""
+
+            # Localisation depuis les tags
+            location = "France"
+            for tag in card.select("div.tw-tag-secondary-s"):
+                text = tag.get_text(strip=True)
+                if _re.search(r"\d{2,5}$|^\d{5}", text):
+                    location = text
+                    break
+
+            # Date relative
+            date_el = card.select_one("div.tw-text-grey-500, span.tw-text-grey-500")
+            date_text = date_el.get_text(strip=True) if date_el else ""
+            date_iso  = _parse_hw_relative_date(date_text) if date_text else datetime.now(timezone.utc).isoformat()
+
+            if not title or not url_job:
+                continue
+
+            # Type de contrat
+            jtype = guess_type(title, "")
+            if contract == "alternance": jtype = "alternance"
+            elif contract == "stage":   jtype = "stage"
+
+            jobs.append({
+                "id":          make_id("hellowork", url_job),
+                "source_url":  search_url,
+                "title":       title,
+                "company":     company,
+                "location":    location,
+                "url":         url_job,
+                "description": "",
+                "date":        date_iso,
+                "type":        jtype,
+            })
+        except Exception as ex:
+            print(f"[hellowork] carte skip: {ex}")
+            continue
+
+    return jobs
+
+
 async def scrape_hellowork(search_url: str, limit: int = 20) -> list[dict]:
     """
-    Scrape HelloWork via leur API JSON interne.
-    Endpoint : https://www.hellowork.com/fr-fr/api/jobs/search
+    Scrape HelloWork par HTML scraping (BeautifulSoup).
+    Technique : li[data-id-storage-item-id] + inputs cachés title/company.
+    Inspiré de github.com/Zeffut/JobScraper
     """
     hw_params = _extract_hellowork_params(search_url)
     keywords  = hw_params["keywords"]
     location  = hw_params["location"]
     contract  = hw_params["contract"]
 
-    # Mapping contrat HelloWork → notre catégorie
-    contract_map = {
-        "alternance":   "ALTERNANCE",
-        "apprentissage":"APPRENTISSAGE",
-        "stage":        "INTERNSHIP",
-        "cdi":          "CDI",
-        "cdd":          "CDD",
-        "freelance":    "FREELANCE",
-    }
-    hw_contract = contract_map.get(contract, "")
-
-    api_params: dict = {
-        "k":       keywords,
-        "l":       location,
-        "nb":      min(limit * 2, 50),  # HelloWork retourne max 50 par page
-        "page":    1,
-        "sorting": "date",              # tri par date de publication
-    }
-    if hw_contract:
-        api_params["c"] = hw_contract
+    # Construire l'URL de recherche HelloWork
+    from urllib.parse import urlencode as _urlencode
+    base = "https://www.hellowork.com/fr-fr/emploi/recherche.html"
+    qp: dict = {"k": keywords, "l": location}
+    if contract:
+        qp["c"] = contract
+    # Tri par date (d=7 = 7 derniers jours)
+    qp["d"] = "7"
+    hw_url = f"{base}?{_urlencode(qp)}"
+    print(f"[hellowork] URL recherche: {hw_url}")
 
     headers = {
-        "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Accept":      "application/json, text/plain, */*",
-        "Accept-Language": "fr-FR,fr;q=0.9",
-        "Referer":     "https://www.hellowork.com/",
-        "Origin":      "https://www.hellowork.com",
+        "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection":      "keep-alive",
     }
 
     jobs: list[dict] = []
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            r = await client.get(
-                "https://www.hellowork.com/fr-fr/api/jobs/search",
-                params=api_params,
-                headers=headers,
-            )
+        loop = asyncio.get_event_loop()
+
+        def _fetch_and_parse():
+            import tls_client as _tls
+            sess = _tls.Session(client_identifier="chrome_120", random_tls_extension_order=True)
+            r = sess.get(hw_url, headers=headers)
+            print(f"[hellowork] status={r.status_code} len={len(r.text)}")
             if r.status_code != 200:
-                raise Exception(f"HelloWork API status {r.status_code}")
+                raise Exception(f"HelloWork HTTP {r.status_code}")
+            return _parse_hw_cards_sync(r.text, search_url, contract, limit)
 
-            data = r.json()
-            # Structure réelle: data["jobs"] ou data["results"] ou data["data"]
-            raw_jobs = (
-                data.get("jobs") or
-                data.get("results") or
-                data.get("data", {}).get("jobs") or
-                []
-            )
-
-            for item in raw_jobs:
-                title   = item.get("title") or item.get("name") or ""
-                company = item.get("company", {}).get("name") if isinstance(item.get("company"), dict) else item.get("company") or item.get("companyName") or ""
-                loc     = item.get("location") or item.get("city") or item.get("place") or ""
-                url_job = item.get("url") or item.get("link") or item.get("applyUrl") or ""
-                if not url_job.startswith("http"):
-                    url_job = f"https://www.hellowork.com{url_job}"
-                desc    = strip_html(item.get("description") or item.get("excerpt") or "")[:400]
-                date    = safe_date(item.get("publishedAt") or item.get("date") or item.get("createdAt"))
-                jtype   = guess_type(title, desc)
-                # Forcer le type si on a un filtre contrat explicite
-                if contract == "alternance": jtype = "alternance"
-                elif contract == "stage":    jtype = "stage"
-
-                if not title or not url_job:
-                    continue
-
-                jobs.append({
-                    "id":          make_id("hellowork", url_job),
-                    "source_url":  search_url,
-                    "title":       title,
-                    "company":     str(company),
-                    "location":    str(loc),
-                    "url":         url_job,
-                    "description": desc,
-                    "date":        date,
-                    "type":        jtype,
-                })
-                if len(jobs) >= limit:
-                    break
+        jobs = await loop.run_in_executor(_executor, _fetch_and_parse)
+        print(f"[hellowork] {len(jobs)} offres parsées")
 
     except Exception as e:
-        print(f"[hellowork] API error: {e} — tentative JSON-LD fallback")
-        # Fallback : scrape_generic_fetch (JSON-LD) si l'API échoue
+        print(f"[hellowork] scraping error: {e} — fallback JSON-LD")
         jobs = await scrape_generic_fetch(search_url, "hellowork", limit)
 
     return jobs[:limit]
