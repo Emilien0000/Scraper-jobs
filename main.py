@@ -222,6 +222,7 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         desc    = str(row.get("description", "") or "")[:400]
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
+        is_direct = bool(row.get("is_direct_apply", False))
 
         # Normalise le type JobSpy → nos catégories
         # IMPORTANT : on check alternance EN PREMIER car JobSpy retourne "internship"
@@ -247,6 +248,7 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
             "description": desc,
             "date":        date,
             "type":        norm_type,
+            "is_direct":   is_direct,
         })
     return jobs
 
@@ -296,6 +298,7 @@ def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job
         desc    = str(row.get("description", "") or "")[:400]
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
+        is_direct = bool(row.get("is_direct_apply", False))
 
         guessed = guess_type(title, desc)
         if guessed == "alternance":
@@ -317,6 +320,7 @@ def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job
             "description": desc,
             "date":        date,
             "type":        norm_type,
+            "is_direct":   is_direct,
         })
     return jobs
 
@@ -1170,6 +1174,7 @@ async def scrape_post(
                         "description": job.get("description", ""),
                         "date":        _normalize_date(job.get("date")),
                         "type":        job.get("type", "emploi"),
+                        "is_direct":   job.get("is_direct", False),
                     })
         if jobs_to_insert:
             try:
@@ -1387,6 +1392,7 @@ async def _auto_scrape_cycle_inner() -> None:
                         "date":        _normalize_date(job.get("date")),
                         "type":        job.get("type", "emploi"),
                         "scraped_at":  datetime.now(timezone.utc).isoformat(),
+                        "is_direct":   job.get("is_direct", False),
                     })
 
         if user_jobs:
