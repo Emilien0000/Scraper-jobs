@@ -25,7 +25,7 @@ from dateutil import parser as dateparser
 # Supabase REST client (léger, sans supabase-py)
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_role key (bypass RLS)
-AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "300"))  # 5 min par défaut
+AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "600"))  # 10 min par défaut (300 trop court avec 30+ users)
 ADZUNA_APP_ID    = os.environ.get("ADZUNA_APP_ID", "")
 ADZUNA_APP_KEY   = os.environ.get("ADZUNA_APP_KEY", "")
 FT_CLIENT_ID     = os.environ.get("FT_CLIENT_ID", "")      # France Travail API OAuth2
@@ -43,7 +43,8 @@ app.add_middleware(
 SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
 
 # Thread pool pour exécuter JobSpy (synchrone) sans bloquer la boucle asyncio
-_executor = ThreadPoolExecutor(max_workers=4)
+# max_workers=8 pour tenir 30 users avec 20 filtres chacun
+_executor = ThreadPoolExecutor(max_workers=8)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1284,8 +1285,18 @@ def _normalize_date(val) -> str:
     except Exception:
         return datetime.now(timezone.utc).isoformat()
 
+# Verrou global : empêche 2 cycles de tourner en même temps
+_scrape_cycle_lock = asyncio.Lock()
+
 async def auto_scrape_cycle() -> None:
     """Un cycle complet d'auto-scrape pour tous les users."""
+    if _scrape_cycle_lock.locked():
+        print("[auto-scrape] ⚠️  Cycle précédent encore en cours — skip")
+        return
+    async with _scrape_cycle_lock:
+        await _auto_scrape_cycle_inner()
+
+async def _auto_scrape_cycle_inner() -> None:
     now = datetime.now(timezone.utc)
     print(f"[auto-scrape] Début cycle — {now.isoformat()}")
 
@@ -1327,7 +1338,9 @@ async def auto_scrape_cycle() -> None:
     print(f"[auto-scrape] {len(url_to_users)} URL(s) unique(s) à scraper pour {len(rows)} user(s)")
 
     # 3. Scraper toutes les URLs uniques (en parallèle, max 5 à la fois)
-    sem = asyncio.Semaphore(5)
+    # Semaphore à 10 pour paralléliser davantage avec 30+ users
+    # (Indeed/FT/Adzuna tolèrent ~10 req simultanées depuis une même IP)
+    sem = asyncio.Semaphore(10)
     scrape_results: dict[str, dict] = {}
 
     async def scrape_one(url: str):
