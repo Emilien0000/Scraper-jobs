@@ -738,7 +738,11 @@ _ft_token_cache: dict = {"token": None, "expires_at": 0}
 async def _ft_get_token() -> str | None:
     """Récupère un token OAuth2 France Travail (mis en cache)."""
     import time
-    if not FT_CLIENT_ID or not FT_CLIENT_SECRET:
+    # Relire depuis l'env à chaque appel pour éviter les valeurs vides au démarrage
+    ft_id     = os.environ.get("FT_CLIENT_ID", "")
+    ft_secret = os.environ.get("FT_CLIENT_SECRET", "")
+    if not ft_id or not ft_secret:
+        print("[francetravail] ⚠️  FT_CLIENT_ID ou FT_CLIENT_SECRET non définis dans l'environnement")
         return None
     now = time.time()
     if _ft_token_cache["token"] and now < _ft_token_cache["expires_at"] - 30:
@@ -752,7 +756,7 @@ async def _ft_get_token() -> str | None:
                 "scope":      "api_offresdemploiv2 o2dsoffre",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            auth=(FT_CLIENT_ID, FT_CLIENT_SECRET),
+            auth=(ft_id, ft_secret),
         )
         if r.status_code != 200:
             print(f"[francetravail] ❌ Token error {r.status_code}: {r.text[:200]}")
