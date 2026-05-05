@@ -652,28 +652,16 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
     elif contract == "stage" and "stage" not in keywords.lower():
         keywords += " stage"
 
-    # Filtre de pertinence — accent-insensitive + stemming léger
-    import unicodedata as _ud
-    def _az_norm(s): return "".join(c for c in _ud.normalize("NFD", s.lower()) if _ud.category(c) != "Mn")
-
-    STOP_WORDS = {"les", "des", "pour", "avec", "dans", "sur", "par", "une", "and", "the",
-                  "stage", "alternance", "france", "emploi", "offre", "poste"}
-    raw_tokens = [w.strip() for w in re.split(r"[\s,;/+]+", keywords) if len(w.strip()) >= 4]
-    raw_tokens = [t for t in raw_tokens if _az_norm(t) not in STOP_WORDS]
-    # Radical : 7 premiers chars normalisés → tolère pluriels et variantes
-    # ex: "cybersécurité" → "cyberse", "développement" → "develop"
-    kw_stems = list({_az_norm(t)[:7] for t in raw_tokens if len(_az_norm(t)) >= 4})
-    if kw_stems:
-        _stem_pat = re.compile("|".join(re.escape(s) for s in kw_stems), re.IGNORECASE)
-        def _az_match(text: str) -> bool:
-            return bool(_stem_pat.search(_az_norm(text)))
-    else:
-        def _az_match(text: str) -> bool: return True
+    # Pas de filtre Python côté Adzuna — on fait confiance au moteur de recherche.
+    # L'ancienne logique stem/7chars filtrait trop agressivement (accents composés,
+    # variantes françaises...) et rejetait des offres légitimes.
+    # Adzuna est une vraie API de recherche : si les résultats semblent hors-sujet,
+    # c'est le mot-clé "what" qui est trop générique — pas besoin de sur-filtrer.
 
     api_params: dict = {
         "app_id":           adzuna_id,
         "app_key":          adzuna_key,
-        "results_per_page": min(limit * 3, 50),  # on rapatrie plus large pour compenser le filtre
+        "results_per_page": min(limit * 2, 50),
         "what":             keywords,
         "sort_by":          "date",
         "max_days_old":     10,
@@ -709,13 +697,6 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
 
                 if not title or not url_job:
                     continue
-
-                # ── Filtre de pertinence (accent-insensitive) ───────────────────
-                if kw_stems and not contract:
-                    if not _az_match(title) and not _az_match(desc):
-                        print(f"[adzuna] ❌ hors-sujet ignoré: '{title}'")
-                        continue
-                # ────────────────────────────────────────────────────────────────
 
                 jobs.append({
                     "id":          make_id("adzuna", url_job),
@@ -915,120 +896,21 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
 
 
 
-# ── Stratégie Welcome to the Jungle : API Algolia (clés publiques) ────────────
-# WTTJ utilise Algolia en interne pour son moteur de recherche.
-# Les clés sont publiques et embarquées dans leur frontend JS — pas d'auth requise.
-# Index FR : wttj_jobs_production_fr
-# Endpoint  : POST https://{APP_ID}-dsn.algolia.net/1/indexes/{INDEX}/query
-
-# Clés Algolia WTTJ — publiques, embarquées dans le frontend JS de WTTJ
-# Mises en cache pour éviter de refetch à chaque appel
-# NOTE : api_key est volontairement vide au démarrage pour forcer un refresh
-_WTTJ_KEYS_CACHE: dict = {
-    "app_id":  "",
-    "api_key": "",
-    "index":   "wttj_jobs_production_fr",
-    "refreshed_at": 0,  # timestamp du dernier refresh
-}
-
-async def _wttj_refresh_keys() -> dict:
-    """
-    Scrape les clés Algolia depuis le JS bundle de WTTJ.
-    Stratégie multi-patterns robuste aux repackagings du frontend.
-    """
-    import time
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            # 1. Récupérer la page principale
-            r = await client.get(
-                "https://www.welcometothejungle.com/fr",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Accept-Language": "fr-FR,fr;q=0.9",
-                },
-            )
-            html = r.text
-
-            # 2. Récupérer tous les bundles JS (pas juste "main")
-            js_urls = re.findall(r'src=["\'](/(?:static|_next/static)[^"\']+\.js)["\']', html)
-            if not js_urls:
-                js_urls = re.findall(r'"(/[^"]+\.js)"', html)
-            print(f"[wttj] 🔍 {len(js_urls)} bundle(s) JS trouvés")
-
-            # 3. Chercher les clés dans chaque bundle (ordre : les plus gros d'abord)
-            for js_path in js_urls[:10]:  # limiter à 10 bundles max
-                try:
-                    rjs = await client.get(
-                        f"https://www.welcometothejungle.com{js_path}",
-                        headers={"User-Agent": "Mozilla/5.0"},
-                        timeout=10,
-                    )
-                    js = rjs.text
-                    if len(js) < 1000:
-                        continue  # skip les petits fichiers
-
-                    # Patterns Algolia connus dans le JS de WTTJ
-                    patterns = [
-                        # Pattern 1 : appId:"XXXX",apiKey:"yyyy"
-                        r'appId["\s:]+["\']([A-Z0-9]{8,12})["\'].*?apiKey["\s:]+["\']([a-f0-9]{32})["\']',
-                        # Pattern 2 : "XXXX","yyyy" (clés côte à côte)
-                        r'["\']([A-Z0-9]{10})["\']\s*,\s*["\']([a-f0-9]{32})["\']',
-                        # Pattern 3 : ALGOLIA_APP_ID / ALGOLIA_API_KEY style env
-                        r'ALGOLIA[_A-Z]*APP[_A-Z]*ID["\s:=]+["\']([A-Z0-9]{8,12})["\'].*?ALGOLIA[_A-Z]*(?:SEARCH|API)[_A-Z]*KEY["\s:=]+["\']([a-f0-9]{32})["\']',
-                    ]
-                    for pat in patterns:
-                        m = re.search(pat, js, re.DOTALL)
-                        if m:
-                            new_id  = m.group(1)
-                            new_key = m.group(2)
-                            _WTTJ_KEYS_CACHE["app_id"]      = new_id
-                            _WTTJ_KEYS_CACHE["api_key"]     = new_key
-                            _WTTJ_KEYS_CACHE["refreshed_at"] = time.time()
-                            print(f"[wttj] 🔑 Clés Algolia rafraîchies: app_id={new_id}")
-                            return _WTTJ_KEYS_CACHE
-                except Exception as _je:
-                    print(f"[wttj] ⚠️  Bundle {js_path[:60]} skip: {_je}")
-                    continue
-
-        print("[wttj] ⚠️  Aucune clé Algolia trouvée dans les bundles JS")
-    except Exception as e:
-        print(f"[wttj] ⚠️  Impossible de rafraîchir les clés: {e}")
-    return _WTTJ_KEYS_CACHE
-
-
-async def _wttj_get_algolia_keys() -> dict:
-    """
-    Retourne les clés Algolia WTTJ, en les rafraîchissant si nécessaire.
-    Refresh forcé si : clés vides, ou cache > 6h.
-    """
-    import time
-    age = time.time() - _WTTJ_KEYS_CACHE.get("refreshed_at", 0)
-    if not _WTTJ_KEYS_CACHE.get("api_key") or age > 6 * 3600:
-        print(f"[wttj] 🔄 Refresh clés Algolia (age={int(age)}s)...")
-        await _wttj_refresh_keys()
-    return _WTTJ_KEYS_CACHE
-
-# Mapping contrats WTTJ → nos catégories
-_WTTJ_CONTRACT_MAP = {
-    "FULL_TIME":        "emploi",
-    "PART_TIME":        "emploi",
-    "TEMPORARY":        "emploi",
-    "FREELANCE":        "emploi",
-    "INTERNSHIP":       "stage",
-    "APPRENTICESHIP":   "alternance",
-    "VIE":              "emploi",
-}
+# ── Stratégie Welcome to the Jungle : DÉSACTIVÉE (IP datacenter bloquée) ────
+# WTTJ bloque toutes les IPs datacenter (Render, Railway, Fly.io, etc.)
+# via une allowlist réseau stricte — "Host not in allowlist".
+# Le scraping Algolia n'est possible que depuis une IP résidentielle ou un proxy.
+# Options : ScraperAPI, BrightData, Oxylabs, ou proxy résidentiel custom.
+# Pour l'instant : retourne [] sans crasher.
 
 def _extract_wttj_params(url: str) -> dict:
     """Extrait keywords, lieu et type de contrat depuis une URL WTTJ."""
+    import unicodedata
     parsed   = urlparse(url)
     params   = parse_qs(parsed.query)
-    path_low = parsed.path.lower()
     url_low  = url.lower()
 
-    # Mots-clés : paramètre 'query' dans l'URL WTTJ
     keywords = params.get("query", params.get("q", [""]))[0]
-    # Fallback depuis le path : /fr/jobs/category/subcategory
     if not keywords:
         parts = [p for p in parsed.path.split("/") if p and p not in ("fr", "en", "jobs", "search")]
         if parts:
@@ -1036,14 +918,10 @@ def _extract_wttj_params(url: str) -> dict:
     if not keywords:
         keywords = "développeur"
 
-    # Localisation
     location = params.get("aroundLatLngViaIP", [""])[0] or params.get("location", ["France"])[0]
 
-    # Contrat : paramètre refinementList[contract_type][]
     contracts = params.get("refinementList[contract_type][]", [])
     contract = contracts[0] if contracts else ""
-
-    # Détecter alternance/stage dans le path/URL
     if not contract:
         if "alternance" in url_low or "apprenticeship" in url_low:
             contract = "APPRENTICESHIP"
@@ -1055,162 +933,14 @@ def _extract_wttj_params(url: str) -> dict:
 
 async def scrape_wttj(search_url: str, limit: int = 20) -> list[dict]:
     """
-    Scrape Welcome to the Jungle via leur API Algolia interne.
-    Clés publiques embarquées dans le frontend WTTJ — pas d'auth requise.
+    WTTJ bloque les IPs datacenter — retourne [] sans crasher.
+    Le log avertit clairement de la cause sans polluer les autres utilisateurs.
     """
-    wttj_p   = _extract_wttj_params(search_url)
-    keywords = wttj_p["keywords"]
-    contract = wttj_p["contract"]
+    print("[wttj] ⚠️  WTTJ bloque les IPs datacenter (Render/Railway). "
+          "Pour activer WTTJ, un proxy résidentiel est nécessaire (ScraperAPI, BrightData…).")
+    return []
 
-    # Construire les facetFilters
-    facet_filters: list = []
-    if contract:
-        facet_filters.append([f"contract_type:{contract}"])
 
-    algolia_body = {
-        "query":       keywords,
-        "hitsPerPage": min(limit * 2, 50),
-        "page":        0,
-        "attributesToRetrieve": [
-            "id", "name", "slug", "organization", "contract_type",
-            "published_at", "updated_at", "department", "office",
-            "profile", "salary",
-        ],
-    }
-    if facet_filters:
-        algolia_body["facetFilters"] = facet_filters
-
-    print(f"[wttj] 🔍 Algolia query — keywords='{keywords}' contract='{contract}'")
-
-    jobs: list[dict] = []
-    try:
-        keys = await _wttj_get_algolia_keys()
-        app_id  = keys["app_id"]
-        api_key = keys["api_key"]
-        index   = keys["index"]
-
-        async with httpx.AsyncClient(timeout=15) as client:
-            # Algolia — essai sur plusieurs hosts car DSN peut être bloqué (Render, Railway)
-            algolia_hosts = [
-                f"https://{app_id}-dsn.algolia.net",
-                f"https://{app_id}-1.algolianet.com",
-                f"https://{app_id}-2.algolianet.com",
-                f"https://{app_id}-3.algolianet.com",
-            ]
-            r = None
-            key_refreshed = False
-            for host in algolia_hosts:
-                try:
-                    r = await client.post(
-                        f"{host}/1/indexes/{index}/query",
-                        headers={
-                            "X-Algolia-Application-Id": app_id,
-                            "X-Algolia-API-Key":        api_key,
-                            "Content-Type":             "application/json",
-                        },
-                        json=algolia_body,
-                        timeout=10,
-                    )
-                    print(f"[wttj] 📡 HTTP {r.status_code} via {host}")
-                    if r.status_code == 200:
-                        break
-                    if r.status_code in (401, 403) and not key_refreshed:
-                        print("[wttj] 🔄 Clés invalides, refresh...")
-                        keys          = await _wttj_refresh_keys()
-                        app_id        = keys["app_id"]
-                        api_key       = keys["api_key"]
-                        key_refreshed = True
-                        # Réessayer le MÊME host avec les nouvelles clés
-                        r = await client.post(
-                            f"{host}/1/indexes/{index}/query",
-                            headers={
-                                "X-Algolia-Application-Id": app_id,
-                                "X-Algolia-API-Key":        api_key,
-                                "Content-Type":             "application/json",
-                            },
-                            json=algolia_body,
-                            timeout=10,
-                        )
-                        print(f"[wttj] 📡 Retry HTTP {r.status_code} via {host}")
-                        if r.status_code == 200:
-                            break
-                except Exception as _he:
-                    print(f"[wttj] ⚠️  {host} inaccessible: {_he}")
-                    r = None
-                    continue
-            if r is None:
-                raise Exception("Tous les hosts Algolia WTTJ inaccessibles")
-            if r.status_code != 200:
-                raise Exception(f"Algolia HTTP {r.status_code}: {r.text[:200]}")
-
-            data = r.json()
-            hits = data.get("hits", [])
-            print(f"[wttj] {len(hits)} hits Algolia pour '{keywords}'")
-
-            for hit in hits:
-                if len(jobs) >= limit:
-                    break
-
-                title   = hit.get("name", "").strip()
-                if not title:
-                    continue
-
-                # Organisation
-                org     = hit.get("organization") or {}
-                company = org.get("name", "").strip()
-                org_slug = org.get("slug", "")
-
-                # Slug offre
-                job_slug = hit.get("slug", hit.get("id", ""))
-
-                # URL de l'offre
-                if job_slug and org_slug:
-                    url_job = f"https://www.welcometothejungle.com/fr/companies/{org_slug}/jobs/{job_slug}"
-                else:
-                    url_job = search_url
-
-                # Localisation : office (peut être une liste)
-                offices = hit.get("office") or []
-                if isinstance(offices, list) and offices:
-                    loc = offices[0].get("city", "") or offices[0].get("country", "France")
-                elif isinstance(offices, dict):
-                    loc = offices.get("city", "") or offices.get("country", "France")
-                else:
-                    loc = "France"
-
-                # Date
-                date = safe_date(hit.get("published_at") or hit.get("updated_at"))
-
-                # Type de contrat
-                raw_contract = hit.get("contract_type", "")
-                if isinstance(raw_contract, list):
-                    raw_contract = raw_contract[0] if raw_contract else ""
-                jtype = _WTTJ_CONTRACT_MAP.get(str(raw_contract).upper(), "emploi")
-                # Override si contrat forcé ou si guess du titre confirme
-                if not contract:
-                    jtype = guess_type(title, "")
-
-                # Description depuis profile (résumé des missions)
-                profile = hit.get("profile", "") or ""
-                desc    = strip_html(str(profile))[:400]
-
-                jobs.append({
-                    "id":          make_id("wttj", url_job),
-                    "source_url":  search_url,
-                    "title":       title,
-                    "company":     company,
-                    "location":    loc,
-                    "url":         url_job,
-                    "description": desc,
-                    "date":        date,
-                    "type":        jtype,
-                })
-
-    except Exception as e:
-        print(f"[wttj] ❌ error: {e}")
-
-    print(f"[wttj] ✅ {len(jobs)} offres retournées")
-    return jobs[:limit]
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
