@@ -26,8 +26,10 @@ from dateutil import parser as dateparser
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_role key (bypass RLS)
 AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "300"))  # 5 min par défaut
-ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID", "")
-ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
+ADZUNA_APP_ID    = os.environ.get("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY   = os.environ.get("ADZUNA_APP_KEY", "")
+FT_CLIENT_ID     = os.environ.get("FT_CLIENT_ID", "")      # France Travail API OAuth2
+FT_CLIENT_SECRET = os.environ.get("FT_CLIENT_SECRET", "")  # https://francetravail.io
 
 app = FastAPI(title="JobScraper JobSpy v3.1", version="3.1.0")
 
@@ -725,6 +727,170 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
     return jobs[:limit]
 
 
+
+# ── Stratégie France Travail : API officielle OAuth2 ─────────────────────────
+# Clés gratuites sur https://francetravail.io → "Créer une application"
+# Scope requis : "o2dsoffre" (offres d'emploi)
+# Env vars : FT_CLIENT_ID, FT_CLIENT_SECRET
+
+_ft_token_cache: dict = {"token": None, "expires_at": 0}
+
+async def _ft_get_token() -> str | None:
+    """Récupère un token OAuth2 France Travail (mis en cache)."""
+    import time
+    if not FT_CLIENT_ID or not FT_CLIENT_SECRET:
+        return None
+    now = time.time()
+    if _ft_token_cache["token"] and now < _ft_token_cache["expires_at"] - 30:
+        return _ft_token_cache["token"]
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            "https://entreprise.francetravail.fr/connexion/oauth2/access_token",
+            params={"realm": "/partenaire"},
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     FT_CLIENT_ID,
+                "client_secret": FT_CLIENT_SECRET,
+                "scope":         "api_offresdemploiv2 o2dsoffre",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if r.status_code != 200:
+            print(f"[francetravail] ❌ Token error {r.status_code}: {r.text[:200]}")
+            return None
+        data = r.json()
+        _ft_token_cache["token"]      = data["access_token"]
+        _ft_token_cache["expires_at"] = now + data.get("expires_in", 1490)
+        print("[francetravail] ✅ Token OK")
+        return _ft_token_cache["token"]
+
+
+def _extract_ft_params(url: str) -> dict:
+    """Extrait keywords, lieu, contrat depuis une URL France Travail."""
+    parsed   = urlparse(url)
+    params   = parse_qs(parsed.query)
+    keywords = params.get("motsCles", params.get("motsCle", params.get("q", ["développeur"])))[0]
+    dept     = params.get("departement", params.get("lieux", [""]))[0]
+    contract = params.get("typeContrat", [""])[0].upper()
+    path_low = parsed.path.lower()
+    url_low  = url.lower()
+    # Détecter alternance/stage dans l'URL
+    if not contract:
+        if "alternance" in url_low or "apprentissage" in url_low:
+            contract = "ALT"   # code France Travail pour apprentissage/alternance
+        elif "stage" in url_low:
+            contract = "STG"
+    return {"keywords": keywords, "dept": dept, "contract": contract}
+
+
+async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
+    """
+    Scrape France Travail via leur API REST officielle v2.
+    Endpoint : GET /offres/search
+    """
+    token = await _ft_get_token()
+    if not token:
+        print("[francetravail] ⚠️  Pas de token — FT_CLIENT_ID/FT_CLIENT_SECRET manquants ?")
+        return []
+
+    ft_p     = _extract_ft_params(search_url)
+    keywords = ft_p["keywords"]
+    dept     = ft_p["dept"]
+    contract = ft_p["contract"]
+
+    # Enrichir les keywords selon contrat
+    if contract == "ALT" and "alternance" not in keywords.lower():
+        keywords += " alternance"
+    elif contract == "STG" and "stage" not in keywords.lower():
+        keywords += " stage"
+
+    api_params: dict = {
+        "motsCles":    keywords,
+        "sort":        1,        # tri par date
+        "range":       f"0-{min(limit * 2, 149)}",
+    }
+    if dept:
+        api_params["departement"] = dept
+    if contract:
+        api_params["typeContrat"] = contract
+
+    # Filtre de pertinence (même logique qu'Adzuna)
+    kw_tokens = [w.strip().lower() for w in re.split(r"[\s,;/+]+", keywords) if len(w.strip()) >= 3]
+    STOP_WORDS = {"les", "des", "pour", "avec", "dans", "sur", "par", "une", "and", "the", "stage", "alternance", "apprentissage"}
+    kw_tokens  = [t for t in kw_tokens if t not in STOP_WORDS]
+    kw_pattern = re.compile("|".join(re.escape(t) for t in kw_tokens), re.IGNORECASE) if kw_tokens else None
+
+    jobs: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                "https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search",
+                params=api_params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept":        "application/json",
+                },
+            )
+            if r.status_code == 206 or r.status_code == 200:
+                data    = r.json()
+                results = data.get("resultats", [])
+            elif r.status_code == 204:
+                results = []
+            else:
+                raise Exception(f"FT API status {r.status_code}: {r.text[:200]}")
+
+            print(f"[francetravail] {len(results)} résultats bruts pour '{keywords}'")
+
+            for item in results:
+                title    = item.get("intitule", "").strip()
+                url_job  = item.get("origineOffre", {}).get("urlOrigine", "") or                            f"https://candidat.francetravail.fr/offres/recherche/detail/{item.get('id','')}"
+                company  = item.get("entreprise", {}).get("nom", "").strip()
+                loc_obj  = item.get("lieuTravail", {})
+                loc      = loc_obj.get("libelle", "") or loc_obj.get("codePostal", "") or "France"
+                desc_raw = item.get("description", "")
+                desc     = strip_html(desc_raw)[:400]
+                date     = safe_date(item.get("dateCreation") or item.get("dateActualisation"))
+
+                # Type de contrat France Travail → nos catégories
+                ft_type  = item.get("typeContrat", "").upper()
+                ft_nature = item.get("natureContrat", "").upper()
+                if ft_type in ("ALT", "APP") or "ALTERNANCE" in ft_nature or "APPRENTISSAGE" in ft_nature:
+                    jtype = "alternance"
+                elif ft_type == "STG" or "STAGE" in ft_nature:
+                    jtype = "stage"
+                else:
+                    jtype = guess_type(title, desc)
+
+                if not title or not url_job:
+                    continue
+
+                # Filtre de pertinence
+                if kw_pattern and not contract:
+                    if not kw_pattern.search(title) and not kw_pattern.search(desc):
+                        print(f"[francetravail] ❌ hors-sujet ignoré: '{title}'")
+                        continue
+
+                jobs.append({
+                    "id":          make_id("francetravail", url_job),
+                    "source_url":  search_url,
+                    "title":       title,
+                    "company":     company,
+                    "location":    loc,
+                    "url":         url_job,
+                    "description": desc,
+                    "date":        date,
+                    "type":        jtype,
+                })
+                if len(jobs) >= limit:
+                    break
+
+    except Exception as e:
+        print(f"[francetravail] error: {e}")
+
+    print(f"[francetravail] ✅ {len(jobs)} offres après filtre")
+    return jobs[:limit]
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 async def scrape_url(url: str, limit: int = 20) -> dict:
@@ -758,6 +924,12 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
         if c == "alternance": filter_cat = "alternance"
         elif c == "stage":    filter_cat = "stage"
         else:                 filter_cat = None
+    elif platform == "francetravail":
+        ft_p = _extract_ft_params(url)
+        c = ft_p.get("contract", "")
+        if c == "ALT":  filter_cat = "alternance"
+        elif c == "STG": filter_cat = "stage"
+        else:            filter_cat = None
     else:
         filter_cat = None
 
@@ -818,6 +990,14 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
             except Exception as e_az:
                 jobs = await scrape_generic_fetch(url, platform, limit * 2)
                 strategy_used = f"generic_fallback (adzuna failed: {e_az})"
+
+        elif platform == "francetravail":
+            try:
+                jobs = await scrape_francetravail(url, limit)
+                strategy_used = "francetravail_api"
+            except Exception as e_ft:
+                jobs = await scrape_generic_fetch(url, platform, limit * 2)
+                strategy_used = f"generic_fallback (francetravail failed: {e_ft})"
 
         else:
             # Toutes les autres plateformes
