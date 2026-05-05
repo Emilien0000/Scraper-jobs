@@ -634,7 +634,10 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
     Scrape Adzuna via leur API REST officielle.
     Nécessite ADZUNA_APP_ID et ADZUNA_APP_KEY dans les variables d'environnement.
     """
-    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+    # Relire depuis l'env à chaque appel (comme FT) pour éviter les globals vides
+    adzuna_id  = os.environ.get("ADZUNA_APP_ID", "") or ADZUNA_APP_ID
+    adzuna_key = os.environ.get("ADZUNA_APP_KEY", "") or ADZUNA_APP_KEY
+    if not adzuna_id or not adzuna_key:
         print("[adzuna] ⚠️  ADZUNA_APP_ID / ADZUNA_APP_KEY non définis — skip")
         return []
 
@@ -658,8 +661,8 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
     kw_pattern = re.compile("|".join(re.escape(t) for t in kw_tokens), re.IGNORECASE) if kw_tokens else None
 
     api_params: dict = {
-        "app_id":           ADZUNA_APP_ID,
-        "app_key":          ADZUNA_APP_KEY,
+        "app_id":           adzuna_id,
+        "app_key":          adzuna_key,
         "results_per_page": min(limit * 3, 50),  # on rapatrie plus large pour compenser le filtre
         "what":             keywords,
         "sort_by":          "date",
@@ -910,9 +913,53 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
 # Index FR : wttj_jobs_production_fr
 # Endpoint  : POST https://{APP_ID}-dsn.algolia.net/1/indexes/{INDEX}/query
 
-WTTJ_ALGOLIA_APP_ID  = "0H5KBVPEX4"
-WTTJ_ALGOLIA_API_KEY = "552fdce494ae02d39a2671ea03af1bd2"
-WTTJ_INDEX_FR        = "wttj_jobs_production_fr"
+# Clés Algolia WTTJ — publiques, embarquées dans le frontend JS de WTTJ
+# Mises en cache pour éviter de refetch à chaque appel
+_WTTJ_KEYS_CACHE: dict = {
+    "app_id":  "0H5KBVPEX4",
+    "api_key": "552fdce494ae02d39a2671ea03af1bd2",
+    "index":   "wttj_jobs_production_fr",
+}
+
+async def _wttj_get_algolia_keys() -> dict:
+    """
+    Retourne les clés Algolia WTTJ.
+    Tente d'abord les valeurs en cache. Si elles échouent (403/401),
+    les récupère depuis le JS du frontend WTTJ (elles y sont en clair).
+    """
+    return _WTTJ_KEYS_CACHE  # On utilise le cache, rafraîchi si échec 401/403
+
+async def _wttj_refresh_keys() -> dict:
+    """Scrape les clés Algolia depuis le JS bundle de WTTJ."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Récupérer la page principale pour trouver le bundle JS
+            r = await client.get(
+                "https://www.welcometothejungle.com/fr",
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"},
+                follow_redirects=True,
+            )
+            html = r.text
+            # Chercher le bundle JS principal
+            js_urls = re.findall(r'src="(/static/[^"]+\.js)"', html)
+            main_js = next((u for u in js_urls if "main" in u or "chunk" in u), js_urls[0] if js_urls else None)
+            if not main_js:
+                return _WTTJ_KEYS_CACHE
+
+            rjs = await client.get(
+                f"https://www.welcometothejungle.com{main_js}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            js = rjs.text
+            # Extraire app_id et api_key depuis le JS (patterns Algolia)
+            app_id_m  = re.search(r'["\']([A-Z0-9]{10})["\']\s*[,;]\s*["\']([a-f0-9]{32})["\']', js)
+            if app_id_m:
+                _WTTJ_KEYS_CACHE["app_id"]  = app_id_m.group(1)
+                _WTTJ_KEYS_CACHE["api_key"] = app_id_m.group(2)
+                print(f"[wttj] 🔑 Clés Algolia rafraîchies: {app_id_m.group(1)}")
+    except Exception as e:
+        print(f"[wttj] ⚠️  Impossible de rafraîchir les clés: {e}")
+    return _WTTJ_KEYS_CACHE
 
 # Mapping contrats WTTJ → nos catégories
 _WTTJ_CONTRACT_MAP = {
@@ -990,17 +1037,38 @@ async def scrape_wttj(search_url: str, limit: int = 20) -> list[dict]:
 
     jobs: list[dict] = []
     try:
+        keys = await _wttj_get_algolia_keys()
+        app_id  = keys["app_id"]
+        api_key = keys["api_key"]
+        index   = keys["index"]
+
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
-                f"https://{WTTJ_ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/{WTTJ_INDEX_FR}/query",
+                f"https://{app_id}-dsn.algolia.net/1/indexes/{index}/query",
                 headers={
-                    "X-Algolia-Application-Id": WTTJ_ALGOLIA_APP_ID,
-                    "X-Algolia-API-Key":        WTTJ_ALGOLIA_API_KEY,
+                    "X-Algolia-Application-Id": app_id,
+                    "X-Algolia-API-Key":        api_key,
                     "Content-Type":             "application/json",
                 },
                 json=algolia_body,
             )
-            print(f"[wttj] 📡 HTTP {r.status_code}")
+            print(f"[wttj] 📡 HTTP {r.status_code} — {r.text[:200]}")
+            # Si les clés sont invalides, tenter un refresh
+            if r.status_code in (401, 403):
+                print("[wttj] 🔄 Clés invalides, tentative de refresh...")
+                keys = await _wttj_refresh_keys()
+                app_id  = keys["app_id"]
+                api_key = keys["api_key"]
+                r = await client.post(
+                    f"https://{app_id}-dsn.algolia.net/1/indexes/{index}/query",
+                    headers={
+                        "X-Algolia-Application-Id": app_id,
+                        "X-Algolia-API-Key":        api_key,
+                        "Content-Type":             "application/json",
+                    },
+                    json=algolia_body,
+                )
+                print(f"[wttj] 📡 Retry HTTP {r.status_code}")
             if r.status_code != 200:
                 raise Exception(f"Algolia HTTP {r.status_code}: {r.text[:200]}")
 
