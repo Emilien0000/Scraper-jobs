@@ -10,6 +10,7 @@
 # Variable d'environnement :
 #   SCRAPER_SECRET=ton_secret_partagefsss
 # ─────────────────────────────────────────────────────────────────────────────
+from bs4 import BeautifulSoup
 import tls_client
 import os, re, json, random, asyncio
 import httpx
@@ -116,7 +117,6 @@ def extract_indeed_jobtype(url: str) -> tuple[str | None, str | None]:
         return (jt, None)
     return (None, None)
 
-
 def filter_by_category(jobs: list[dict], category: str | None) -> list[dict]:
     """
     Post-filtre les offres selon la catégorie voulue.
@@ -165,6 +165,38 @@ def filter_by_category(jobs: list[dict], category: str | None) -> list[dict]:
                 filtered.append(job)
 
     return filtered
+
+def _check_indeed_easy_apply_manually(job_url: str) -> bool:
+    """Ouvre la page Indeed et cherche le bouton Candidature simplifiée."""
+    import tls_client
+    
+    # On utilise tls_client pour bypasser les sécurités Cloudflare d'Indeed
+    session = tls_client.Session(
+        client_identifier="chrome_124",
+        random_tls_extension_order=True
+    )
+    
+    try:
+        res = session.get(job_url, headers=browser_headers())
+        if res.status_code != 200:
+            return False
+            
+        # Analyse du HTML
+        soup = BeautifulSoup(res.text, "lxml")
+        
+        # 1er test : Le bouton officiel d'Indeed a souvent cet ID spécifique
+        if soup.find(id="indeedApplyButton"):
+            return True
+            
+        # 2ème test (sécurité) : On cherche le texte exact dans la page
+        texte_page = res.text.lower()
+        if "candidature simplifiée" in texte_page or "postuler sur indeed" in texte_page:
+            return True
+            
+    except Exception as e:
+        print(f"[indeed-manual] Erreur vérif étoile sur {job_url} : {e}")
+        
+    return False
 
 def guess_type(title: str, description: str = "") -> str:
     text = (title + " " + description).lower()
@@ -222,7 +254,14 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         desc    = str(row.get("description", "") or "")[:400]
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
-        is_direct = bool(row.get("is_direct_apply", False))
+        
+        raw_direct = row.get("is_direct_apply")
+        is_direct = bool(raw_direct) and str(raw_direct).lower() not in ('nan', 'none', 'false', '0')
+        
+        # --- NOUVEAU : LA VÉRIFICATION MANUELLE ---
+        # Si JobSpy a raté l'info, on envoie notre propre requête pour vérifier le bouton
+        if not is_direct and url_job:
+            is_direct = _check_indeed_easy_apply_manually(url_job)
 
         # Normalise le type JobSpy → nos catégories
         # IMPORTANT : on check alternance EN PREMIER car JobSpy retourne "internship"
