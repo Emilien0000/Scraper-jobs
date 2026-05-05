@@ -856,11 +856,20 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
                 date     = safe_date(item.get("dateCreation") or item.get("dateActualisation"))
 
                 # Type de contrat France Travail → nos catégories
-                ft_type  = item.get("typeContrat", "").upper()
+                ft_type   = item.get("typeContrat", "").upper()
                 ft_nature = item.get("natureContrat", "").upper()
-                if ft_type in ("ALT", "APP") or "ALTERNANCE" in ft_nature or "APPRENTISSAGE" in ft_nature:
+                ft_libelle = item.get("typeContratLibelle", "").upper()
+
+                is_alt = (
+                    ft_type in ("ALT", "APP")
+                    or "ALTERNANCE" in ft_nature or "ALTERNANCE" in ft_libelle
+                    or "APPRENTISSAGE" in ft_nature or "APPRENTISSAGE" in ft_libelle
+                )
+                is_stg = ft_type == "STG" or "STAGE" in ft_nature or "STAGE" in ft_libelle
+
+                if is_alt:
                     jtype = "alternance"
-                elif ft_type == "STG" or "STAGE" in ft_nature:
+                elif is_stg:
                     jtype = "stage"
                 else:
                     jtype = guess_type(title, desc)
@@ -868,7 +877,26 @@ async def scrape_francetravail(search_url: str, limit: int = 20) -> list[dict]:
                 if not title or not url_job:
                     continue
 
-                # Filtre de pertinence
+                # ── Filtre strict selon le contrat demandé ──────────────────────
+                # Si l'utilisateur filtre sur "alternance", on rejette toute offre
+                # que FT ne classe pas explicitement comme ALT/APP — même si le
+                # moteur FT l'a renvoyée. Idem pour "stage".
+                if contract == "ALT" and jtype != "alternance":
+                    # Dernière chance : le texte confirme-t-il l'alternance ?
+                    text_check = f"{title} {desc}".lower()
+                    if not re.search(r"alternance|alternant|apprentissage|contrat pro|contrat d.alternance", text_check):
+                        print(f"[francetravail] ❌ rejeté (non-alternance): '{title}' [{ft_type}/{ft_nature}]")
+                        continue
+                    jtype = "alternance"  # confirmé par le texte
+
+                elif contract == "STG" and jtype != "stage":
+                    text_check = f"{title} {desc}".lower()
+                    if not re.search(r"stage|stagiaire|internship", text_check):
+                        print(f"[francetravail] ❌ rejeté (non-stage): '{title}' [{ft_type}/{ft_nature}]")
+                        continue
+                    jtype = "stage"
+
+                # Filtre de pertinence mots-clés (uniquement si pas de contrat spécifique)
                 if kw_pattern and not contract:
                     if not kw_pattern.search(title) and not kw_pattern.search(desc):
                         print(f"[francetravail] ❌ hors-sujet ignoré: '{title}'")
