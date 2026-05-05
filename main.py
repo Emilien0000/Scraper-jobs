@@ -748,12 +748,11 @@ async def _ft_get_token() -> str | None:
             "https://entreprise.francetravail.fr/connexion/oauth2/access_token",
             params={"realm": "/partenaire"},
             data={
-                "grant_type":    "client_credentials",
-                "client_id":     FT_CLIENT_ID,
-                "client_secret": FT_CLIENT_SECRET,
-                "scope":         "api_offresdemploiv2 o2dsoffre",
+                "grant_type": "client_credentials",
+                "scope":      "api_offresdemploiv2 o2dsoffre",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
+            auth=(FT_CLIENT_ID, FT_CLIENT_SECRET),
         )
         if r.status_code != 200:
             print(f"[francetravail] ❌ Token error {r.status_code}: {r.text[:200]}")
