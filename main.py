@@ -807,6 +807,10 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
         jobs = filter_by_category(jobs, filter_cat)
 
     # On s'assure de ne renvoyer que la limite demandée (20)
+    # IMPORTANT : forcer source_url = URL réelle de recherche (pas la string fixe "indeed"/"linkedin")
+    # pour que le frontend puisse matcher j.sourceUrl === filterUrl
+    for job in jobs:
+        job["source_url"] = url
     final_jobs = jobs[:limit]
 
     return {
