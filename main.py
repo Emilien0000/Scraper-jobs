@@ -293,13 +293,23 @@ def _jobspy_scrape_sync(keywords: str, location: str, results_wanted: int, job_t
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
         
+        # JobSpy Indeed : is_direct_apply n'est jamais rempli.
+        # Signal fiable : job_url_direct = URL externe de l'employeur.
+        # Si vide/None → pas d'URL externe → candidature directement sur Indeed (Easy Apply).
         raw_direct = row.get("is_direct_apply")
         is_direct = bool(raw_direct) and str(raw_direct).lower() not in ('nan', 'none', 'false', '0')
         
-        # --- NOUVEAU : LA VÉRIFICATION MANUELLE ---
-        # Si JobSpy a raté l'info, on envoie notre propre requête pour vérifier le bouton
-        if not is_direct and url_job:
-            is_direct = _check_indeed_easy_apply_manually(url_job)
+        if not is_direct:
+            job_url_direct = row.get("job_url_direct")
+            url_direct_str = str(job_url_direct) if job_url_direct is not None else ""
+            # Si pas d'URL externe → Indeed Apply (Easy Apply)
+            if not url_direct_str or url_direct_str.lower() in ('nan', 'none', ''):
+                is_direct = True
+            # Si l'URL externe est sur indeed.com lui-même → aussi Easy Apply
+            elif "indeed.com" in url_direct_str:
+                is_direct = True
+        
+        # Plus besoin du fallback HTML (Indeed bloque les IPs datacenter en 403)
 
         # Normalise le type JobSpy → nos catégories
         # IMPORTANT : on check alternance EN PREMIER car JobSpy retourne "internship"
