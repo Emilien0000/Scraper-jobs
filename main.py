@@ -198,6 +198,44 @@ def _check_indeed_easy_apply_manually(job_url: str) -> bool:
         
     return False
 
+def _check_linkedin_easy_apply(job_url: str) -> bool:
+    """
+    Ouvre la page LinkedIn et cherche le bouton Easy Apply.
+    LinkedIn signale l'Easy Apply via un attribut data ou le texte du bouton.
+    Note : LinkedIn redirige souvent vers login depuis les IPs datacenter —
+    dans ce cas on retombe sur False sans crasher.
+    """
+    session = tls_client.Session(
+        client_identifier="chrome_124",
+        random_tls_extension_order=True
+    )
+    try:
+        res = session.get(job_url, headers=browser_headers(referer="https://www.linkedin.com/"))
+        if res.status_code != 200:
+            return False
+
+        texte = res.text.lower()
+
+        # Signal 1 : attribut data-is-easy-apply dans le HTML (présent dans certaines versions)
+        if 'data-is-easy-apply="true"' in res.text:
+            return True
+
+        # Signal 2 : texte "easy apply" ou "candidature simplifiée" dans la page
+        if "easy apply" in texte or "candidature simplifiée" in texte:
+            return True
+
+        # Signal 3 : bouton avec classe jobs-apply-button et texte easy apply
+        soup = BeautifulSoup(res.text, "lxml")
+        apply_btn = soup.find("button", {"class": lambda c: c and "jobs-apply-button" in c})
+        if apply_btn and "easy apply" in apply_btn.get_text(strip=True).lower():
+            return True
+
+    except Exception as e:
+        print(f"[linkedin-manual] Erreur vérif easy apply sur {job_url} : {e}")
+
+    return False
+
+
 def guess_type(title: str, description: str = "") -> str:
     text = (title + " " + description).lower()
     # Alternance EN PREMIER — sinon "stage en alternance" serait classé stage
@@ -337,7 +375,14 @@ def _jobspy_linkedin_sync(keywords: str, location: str, results_wanted: int, job
         desc    = str(row.get("description", "") or "")[:400]
         date    = safe_date(row.get("date_posted"))
         jtype   = str(row.get("job_type", "") or "")
-        is_direct = bool(row.get("is_direct_apply", False))
+
+        # Même logique robuste que Indeed : pandas retourne souvent NaN/None comme string
+        raw_direct = row.get("is_direct_apply")
+        is_direct = bool(raw_direct) and str(raw_direct).lower() not in ('nan', 'none', 'false', '0')
+
+        # Fallback manuel si JobSpy n'a pas détecté l'Easy Apply
+        if not is_direct and url_job:
+            is_direct = _check_linkedin_easy_apply(url_job)
 
         guessed = guess_type(title, desc)
         if guessed == "alternance":
