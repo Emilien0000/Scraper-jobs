@@ -26,6 +26,8 @@ from dateutil import parser as dateparser
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_role key (bypass RLS)
 AUTO_SCRAPE_INTERVAL = int(os.environ.get("AUTO_SCRAPE_INTERVAL", "300"))  # 5 min par défaut
+ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
 
 app = FastAPI(title="JobScraper JobSpy v3.1", version="3.1.0")
 
@@ -68,7 +70,8 @@ def detect_platform(url: str) -> str:
     if "linkedin.com"       in url: return "linkedin"
     if "hellowork.com"      in url: return "hellowork"
     if "welcometothejungle" in url: return "wtj"
-    if "adzuna"             in url: return "adzuna"
+    if "adzuna.fr"          in url: return "adzuna"
+    if "adzuna.com"         in url: return "adzuna"
     if "francetravail"      in url: return "francetravail"
     if "pole-emploi"        in url: return "francetravail"
     if "labonnealternance"  in url: return "lba"
@@ -604,6 +607,107 @@ async def scrape_hellowork(search_url: str, limit: int = 20) -> list[dict]:
     return jobs[:limit]
 
 
+
+# ── Stratégie Adzuna : API officielle ────────────────────────────────────────
+# Adzuna agrège Indeed, Monster, etc. via une API REST gratuite.
+# Clés gratuites sur https://developer.adzuna.com/
+# Env vars : ADZUNA_APP_ID, ADZUNA_APP_KEY
+
+def _extract_adzuna_params(url: str) -> dict:
+    """Extrait keywords, lieu, contrat depuis une URL Adzuna."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    keywords = params.get("q", params.get("what", ["développeur"]))[0]
+    location = params.get("l", params.get("where", [""]))[0]
+    contract = params.get("c", [""])[0].lower()
+    path_lower = parsed.path.lower()
+    if not contract:
+        if "alternance" in path_lower or "alternance" in url.lower(): contract = "alternance"
+        elif "stage"    in path_lower or "stage"    in url.lower(): contract = "stage"
+    return {"keywords": keywords, "location": location, "contract": contract}
+
+
+async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
+    """
+    Scrape Adzuna via leur API REST officielle.
+    Nécessite ADZUNA_APP_ID et ADZUNA_APP_KEY dans les variables d'environnement.
+    """
+    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+        print("[adzuna] ⚠️  ADZUNA_APP_ID / ADZUNA_APP_KEY non définis — skip")
+        return []
+
+    az_params = _extract_adzuna_params(search_url)
+    keywords  = az_params["keywords"]
+    location  = az_params["location"]
+    contract  = az_params["contract"]
+
+    # Enrichir les keywords selon le contrat
+    if contract == "alternance" and "alternance" not in keywords.lower():
+        keywords += " alternance"
+    elif contract == "stage" and "stage" not in keywords.lower():
+        keywords += " stage"
+
+    api_params: dict = {
+        "app_id":          ADZUNA_APP_ID,
+        "app_key":         ADZUNA_APP_KEY,
+        "results_per_page": min(limit * 2, 50),
+        "what":            keywords,
+        "sort_by":         "date",
+        "max_days_old":    10,
+    }
+    if location:
+        api_params["where"] = location
+
+    jobs: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                "https://api.adzuna.com/v1/api/jobs/fr/search/1",
+                params=api_params,
+            )
+            if r.status_code != 200:
+                raise Exception(f"Adzuna API status {r.status_code}: {r.text[:200]}")
+
+            data    = r.json()
+            results = data.get("results", [])
+            print(f"[adzuna] {len(results)} résultats bruts")
+
+            for item in results:
+                job_id  = item.get("id", "")
+                title   = item.get("title", "").strip()
+                company = item.get("company", {}).get("display_name", "").strip()
+                loc     = item.get("location", {}).get("display_name", "").strip() or "France"
+                url_job = item.get("redirect_url", "")
+                desc    = strip_html(item.get("description", ""))[:400]
+                created = item.get("created", "")
+                date    = safe_date(created)
+                jtype   = guess_type(title, desc)
+                if contract == "alternance": jtype = "alternance"
+                elif contract == "stage":   jtype = "stage"
+
+                if not title or not url_job:
+                    continue
+
+                jobs.append({
+                    "id":          make_id("adzuna", url_job),
+                    "source_url":  search_url,
+                    "title":       title,
+                    "company":     company,
+                    "location":    loc,
+                    "url":         url_job,
+                    "description": desc,
+                    "date":        date,
+                    "type":        jtype,
+                })
+                if len(jobs) >= limit:
+                    break
+
+    except Exception as e:
+        print(f"[adzuna] error: {e}")
+
+    return jobs[:limit]
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 async def scrape_url(url: str, limit: int = 20) -> dict:
@@ -631,6 +735,12 @@ async def scrape_url(url: str, limit: int = 20) -> dict:
         if c in ("alternance", "apprentissage"): filter_cat = "alternance"
         elif c == "stage":                        filter_cat = "stage"
         else:                                     filter_cat = None
+    elif platform == "adzuna":
+        az_p = _extract_adzuna_params(url)
+        c = az_p.get("contract", "")
+        if c == "alternance": filter_cat = "alternance"
+        elif c == "stage":    filter_cat = "stage"
+        else:                 filter_cat = None
     else:
         filter_cat = None
 
@@ -722,7 +832,7 @@ class ScrapeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "job-scraper", "version": "3.1.0", "strategy": "jobspy_indeed+linkedin+hellowork+jsonld"}
+    return {"status": "ok", "service": "job-scraper", "version": "3.1.0", "strategy": "jobspy_indeed+linkedin+hellowork+adzuna+jsonld"}
 
 
 @app.post("/scrape")
