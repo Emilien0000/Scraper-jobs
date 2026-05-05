@@ -647,13 +647,21 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
     elif contract == "stage" and "stage" not in keywords.lower():
         keywords += " stage"
 
+    # Construire le pattern de pertinence à partir des keywords de l'URL
+    # On tokenise les mots de 3+ caractères pour filtrer les résultats hors-sujet
+    kw_tokens = [w.strip().lower() for w in re.split(r"[\s,;/+]+", keywords) if len(w.strip()) >= 3]
+    # On exclut les mots génériques qui ne discriminent pas le métier
+    STOP_WORDS = {"les", "des", "pour", "avec", "dans", "sur", "par", "une", "and", "the", "stage", "alternance"}
+    kw_tokens = [t for t in kw_tokens if t not in STOP_WORDS]
+    kw_pattern = re.compile("|".join(re.escape(t) for t in kw_tokens), re.IGNORECASE) if kw_tokens else None
+
     api_params: dict = {
-        "app_id":          ADZUNA_APP_ID,
-        "app_key":         ADZUNA_APP_KEY,
-        "results_per_page": min(limit * 2, 50),
-        "what":            keywords,
-        "sort_by":         "date",
-        "max_days_old":    10,
+        "app_id":           ADZUNA_APP_ID,
+        "app_key":          ADZUNA_APP_KEY,
+        "results_per_page": min(limit * 3, 50),  # on rapatrie plus large pour compenser le filtre
+        "what":             keywords,
+        "sort_by":          "date",
+        "max_days_old":     10,
     }
     if location:
         api_params["where"] = location
@@ -670,10 +678,9 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
 
             data    = r.json()
             results = data.get("results", [])
-            print(f"[adzuna] {len(results)} résultats bruts")
+            print(f"[adzuna] {len(results)} résultats bruts pour keywords='{keywords}'")
 
             for item in results:
-                job_id  = item.get("id", "")
                 title   = item.get("title", "").strip()
                 company = item.get("company", {}).get("display_name", "").strip()
                 loc     = item.get("location", {}).get("display_name", "").strip() or "France"
@@ -687,6 +694,15 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
 
                 if not title or not url_job:
                     continue
+
+                # ── Filtre de pertinence universel ──────────────────────────────
+                # On vérifie que le titre OU la description contient au moins un
+                # des mots-clés de la recherche. Marche pour dev, cuisinier, etc.
+                if kw_pattern and not contract:
+                    if not kw_pattern.search(title) and not kw_pattern.search(desc):
+                        print(f"[adzuna] ❌ hors-sujet ignoré: '{title}'")
+                        continue
+                # ────────────────────────────────────────────────────────────────
 
                 jobs.append({
                     "id":          make_id("adzuna", url_job),
@@ -705,6 +721,7 @@ async def scrape_adzuna(search_url: str, limit: int = 20) -> list[dict]:
     except Exception as e:
         print(f"[adzuna] error: {e}")
 
+    print(f"[adzuna] ✅ {len(jobs)} offres après filtre pertinence")
     return jobs[:limit]
 
 
