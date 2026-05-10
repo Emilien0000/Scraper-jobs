@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dateutil import parser as dateparser
+import hashlib
 
 # Supabase REST client (léger, sans supabase-py)
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
@@ -331,8 +332,11 @@ def safe_date(val) -> str:
     try:    return dateparser.parse(str(val)).replace(tzinfo=timezone.utc).isoformat()
     except: return datetime.now(timezone.utc).isoformat()
 
+import hashlib # Ajoute ceci en haut du fichier si ce n'est pas déjà fait
+
 def make_id(platform: str, url: str) -> str:
-    return f"{platform}-{abs(hash(url)) % (10**9):09d}"
+    url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:9]
+    return f"{platform}-{url_hash}"
 
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text or "").strip()
